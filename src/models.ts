@@ -1,236 +1,243 @@
 /**
  * Model list for the Devin (Cognition) provider.
  *
- * Two paths:
- *   1. {@link FALLBACK_MODELS} — 11 static entries shown before login or
- *      when the live catalog fetch fails. Carries real pricing.
- *   2. {@link buildLiveModels} — filters the live `GetCascadeModelConfigs`
- *      catalog to the 11 model families we care about, stamping each entry
- *      with pricing/metadata from {@link MODEL_OVERRIDES}.
+ * Each model family is registered twice:
+ *   1. As a base model (`claude-opus-5-5`) whose thinking level Pi controls;
+ *      {@link resolveDevinTarget} turns model + level into the Cognition
+ *      variant UID (`claude-opus-5-5-high`).
+ *   2. As explicit variants (`claude-opus-5-5-high`) pinned to one effort,
+ *      so sessions and settings that name a variant keep working.
  *
- * The catalog only carries `modelUid`, `label`, and `disabled` — it does
- * NOT include context window, max output tokens, reasoning capability, or
- * pricing. We supply all of those from {@link MODEL_OVERRIDES}, keyed by
- * prefix so variants (e.g. `claude-opus-4-8-medium`, `gpt-5-6-sol-low`)
- * inherit the correct metadata from their parent family.
+ * Context window, output limit and pricing come live from the account's
+ * catalog; the static numbers below cover startup and offline use.
  */
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
-import type { CacheEntry } from './cloud-direct/index.js';
+import type { ModelThinkingLevel, ThinkingLevelMap } from '@earendil-works/pi-ai';
+import type { ModelCatalog, ModelCatalogEntry } from './cloud-direct/index.js';
 
-/** Default Cognition/Codeium host. */
-const DEFAULT_HOST = 'https://server.codeium.com';
+/** Cognition effort levels, weakest first. */
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+type Effort = (typeof EFFORTS)[number];
 
-/**
- * Prefixes of the 11 model families we want from the live catalog.
- * Prefix matching catches variants (e.g. `swe-1-7-lightning`,
- * `gpt-5-6-sol-low`, `claude-opus-4-8-high`).
- */
-export const WANTED_PREFIXES: readonly string[] = [
-    'swe-1-7',
-    'gpt-5-6-sol',
-    'gpt-5-6-luna',
-    'gpt-5-6-terra',
-    'claude-opus-4-8',
-    'claude-fable-5',
-    'claude-sonnet-5',
-    'glm-5-2',
-    'kimi-k2-7',
-    'grok-4-5',
-];
+const DEFAULT_EFFORT: Effort = 'medium';
 
-function matchesWantedPrefix(uid: string): boolean {
-    for (const prefix of WANTED_PREFIXES) {
-        if (uid === prefix || uid.startsWith(prefix + '-') || uid.startsWith(prefix + '_')) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * Per-model metadata + pricing, keyed by prefix.
- *
- * All prices are per million tokens (USD). Used by both
- * {@link FALLBACK_MODELS} and {@link buildLiveModels} so there is a single
- * source of truth for pricing.
- */
 interface ModelMeta {
-    contextWindow: number;
-    maxTokens: number;
-    reasoning: boolean;
-    input: ('text' | 'image')[];
-    cost: {
-        input: number;
-        output: number;
-        cacheRead: number;
-        cacheWrite: number;
-    };
+  contextWindow: number;
+  maxTokens: number;
+  /** USD per million tokens. */
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
-const MODEL_META: Map<string, ModelMeta> = new Map([
-    ['swe-1-7', {
-        contextWindow: 256_000,
-        maxTokens: 128_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    }],
-    ['swe-1-7-lightning', {
-        contextWindow: 256_000,
-        maxTokens: 128_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 2.50, output: 12.50, cacheRead: 0.25, cacheWrite: 3.13 },
-    }],
-    ['gpt-5-6-sol', {
-        contextWindow: 1_050_000,
-        maxTokens: 128_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 5.00, output: 30.00, cacheRead: 0.50, cacheWrite: 6.25 },
-    }],
-    ['gpt-5-6-luna', {
-        contextWindow: 1_050_000,
-        maxTokens: 128_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 1.00, output: 6.00, cacheRead: 0.10, cacheWrite: 1.25 },
-    }],
-    ['gpt-5-6-terra', {
-        contextWindow: 1_050_000,
-        maxTokens: 128_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 2.50, output: 15.00, cacheRead: 0.25, cacheWrite: 3.13 },
-    }],
-    ['claude-opus-4-8', {
-        contextWindow: 200_000,
-        maxTokens: 128_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },
-    }],
-    ['claude-fable-5', {
-        contextWindow: 1_000_000,
-        maxTokens: 128_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 10.00, output: 50.00, cacheRead: 1.00, cacheWrite: 12.50 },
-    }],
-    ['claude-sonnet-5', {
-        contextWindow: 200_000,
-        maxTokens: 64_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 3.00, output: 15.00, cacheRead: 0.30, cacheWrite: 3.75 },
-    }],
-    ['glm-5-2', {
-        contextWindow: 1_000_000,
-        maxTokens: 131_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 0.70, output: 2.20, cacheRead: 0.26, cacheWrite: 0.88 },
-    }],
-    ['kimi-k2-7', {
-        contextWindow: 256_000,
-        maxTokens: 256_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 0.95, output: 4.00, cacheRead: 0.19, cacheWrite: 1.19 },
-    }],
-    ['grok-4-5', {
-        contextWindow: 500_000,
-        maxTokens: 128_000,
-        reasoning: true,
-        input: ['text', 'image'],
-        cost: { input: 2.00, output: 6.00, cacheRead: 0.50, cacheWrite: 2.50 },
-    }],
-]);
-
-/**
- * Find the best-matching metadata for a UID by longest-prefix match
- * against {@link MODEL_META}. This lets `swe-1-7-lightning` match the
- * `swe-1-7-lightning` entry (specific) and `gpt-5-6-sol-low` match the
- * `gpt-5-6-sol` entry (parent family).
- */
-function findMeta(uid: string): ModelMeta | undefined {
-    let best: { key: string; meta: ModelMeta } | null = null;
-    for (const [key, meta] of MODEL_META) {
-        if (uid === key || uid.startsWith(key + '-') || uid.startsWith(key + '_')) {
-            if (!best || key.length > best.key.length) {
-                best = { key, meta };
-            }
-        }
-    }
-    return best?.meta;
+interface Family extends ModelMeta {
+  /** Base model id registered in Pi. */
+  id: string;
+  label: string;
+  /** Cognition UIDs are `<uidPrefix>-<effort>` plus `-fast` for fast families. */
+  uidPrefix: string;
+  fast: boolean;
+  efforts: readonly Effort[];
 }
 
-/** Conservative defaults for catalog UIDs not in the override table. */
-const DEFAULT_META: ModelMeta = {
-    contextWindow: 256_000,
+const FAMILIES: readonly Family[] = [
+  {
+    id: 'gemini-4-neon',
+    label: 'Gemini 4 Neon',
+    uidPrefix: 'gemini-4-neon',
+    fast: false,
+    efforts: ['low', 'medium', 'high', 'xhigh'],
+    contextWindow: 1_048_576,
+    maxTokens: 65_536,
+    cost: { input: 3, output: 15, cacheRead: 0.15, cacheWrite: 0 },
+  },
+  {
+    id: 'claude-opus-5-5',
+    label: 'Claude Opus 5.5',
+    uidPrefix: 'claude-opus-5-5',
+    fast: false,
+    efforts: EFFORTS,
+    contextWindow: 1_000_000,
     maxTokens: 128_000,
-    reasoning: true,
-    input: ['text', 'image'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-};
+    cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+  },
+  {
+    id: 'claude-opus-5-5-fast',
+    label: 'Claude Opus 5.5 Fast',
+    uidPrefix: 'claude-opus-5-5',
+    fast: true,
+    efforts: EFFORTS,
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    cost: { input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 },
+  },
+  {
+    id: 'claude-fable-5-2',
+    label: 'Claude Fable 5.2',
+    uidPrefix: 'claude-fable-5-2',
+    fast: false,
+    efforts: EFFORTS,
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    cost: { input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10 },
+  },
+  {
+    id: 'claude-fable-5-2-fast',
+    label: 'Claude Fable 5.2 Fast',
+    uidPrefix: 'claude-fable-5-2',
+    fast: true,
+    efforts: EFFORTS,
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    cost: { input: 16, output: 80, cacheRead: 0.4, cacheWrite: 20 },
+  },
+];
 
-function makeModel(id: string, name: string, meta: ModelMeta): ProviderModelConfig {
-    return {
-        id,
-        name,
-        reasoning: meta.reasoning,
-        input: meta.input,
-        cost: meta.cost,
-        contextWindow: meta.contextWindow,
-        maxTokens: meta.maxTokens,
-    };
+const IMAGE_LIMITS = {
+  images: { resize: { maxWidth: 2000, maxHeight: 2000, maxBytes: 4_718_592, jpegQuality: 80 } },
+} as const;
+
+const variantUid = (family: Family, effort: Effort): string =>
+  `${family.uidPrefix}-${effort}${family.fast ? '-fast' : ''}`;
+
+/** Every known variant UID -> its family and pinned effort. */
+const VARIANTS = new Map<string, { family: Family; effort: Effort }>(
+  FAMILIES.flatMap((family) =>
+    family.efforts.map((effort) => [variantUid(family, effort), { family, effort }] as const),
+  ),
+);
+
+const FAMILY_BY_ID = new Map(FAMILIES.map((family) => [family.id, family]));
+
+/**
+ * The family a catalog UID belongs to, including variants this file does not
+ * know yet (a new effort level, say), or undefined for unrelated models.
+ */
+function familyOf(uid: string): Family | undefined {
+  const known = VARIANTS.get(uid)?.family ?? FAMILY_BY_ID.get(uid);
+  if (known) return known;
+  const fast = uid.endsWith('-fast');
+  return FAMILIES.find(
+    (f) => f.fast === fast && (uid.startsWith(`${f.uidPrefix}-`) || uid.startsWith(`${f.uidPrefix}_`)),
+  );
+}
+
+/** The strongest effort the family supports that does not exceed the requested level. */
+function pickEffort(family: Family, level: ModelThinkingLevel | undefined): Effort {
+  if (!level || level === 'off') return DEFAULT_EFFORT;
+  const ceiling = EFFORTS.indexOf(level as Effort); // -1 for levels below `low`
+  return family.efforts.findLast((e) => EFFORTS.indexOf(e) <= ceiling) ?? family.efforts[0];
 }
 
 /**
- * Static fallback list — 11 models with real pricing.
- * Shown before login or when the live catalog fetch fails.
+ * Resolve a Pi model id plus requested thinking level to the Cognition
+ * `model_uid` to call and the effort that UID runs at.
  */
+export function resolveDevinTarget(
+  modelId: string,
+  level?: ModelThinkingLevel,
+): { modelUid: string; providerThinkingLevel?: string } {
+  const family = FAMILY_BY_ID.get(modelId);
+  if (family) {
+    const effort = pickEffort(family, level);
+    return { modelUid: variantUid(family, effort), providerThinkingLevel: effort };
+  }
+  return { modelUid: modelId, providerThinkingLevel: VARIANTS.get(modelId)?.effort };
+}
+
+function thinkingLevelMap(efforts: readonly Effort[]): ThinkingLevelMap {
+  const supported = (effort: Effort): Effort | null => (efforts.includes(effort) ? effort : null);
+  return {
+    off: null,
+    minimal: null,
+    low: supported('low'),
+    medium: supported('medium'),
+    high: supported('high'),
+    xhigh: supported('xhigh'),
+    max: supported('max'),
+  };
+}
+
+/** Overlay the live catalog's limits and pricing on a family's static numbers. */
+function resolveMeta(family: ModelMeta, live?: ModelCatalogEntry): ModelMeta {
+  if (!live) return family;
+  const contextWindow = live.contextWindow ?? family.contextWindow;
+  // Cognition reports a 1,000,000-token output limit for Gemini models, which
+  // is really their context window. Distrust anything above half the window.
+  const maxTokens = live.maxTokens && live.maxTokens <= contextWindow / 2 ? live.maxTokens : family.maxTokens;
+  return {
+    contextWindow,
+    maxTokens,
+    cost: {
+      input: live.pricing?.input ?? family.cost.input,
+      output: live.pricing?.output ?? family.cost.output,
+      cacheRead: live.pricing?.cachedInput ?? family.cost.cacheRead,
+      cacheWrite: family.cost.cacheWrite, // not in the catalog
+    },
+  };
+}
+
+function makeModel(
+  id: string,
+  name: string,
+  meta: ModelMeta,
+  efforts: readonly Effort[] | undefined,
+): ProviderModelConfig {
+  return {
+    type: 'chat',
+    id,
+    name,
+    reasoning: true,
+    ...(efforts ? { thinkingLevelMap: thinkingLevelMap(efforts) } : {}),
+    input: ['text', 'image'],
+    inputLimits: IMAGE_LIMITS,
+    cost: meta.cost,
+    contextWindow: meta.contextWindow,
+    maxTokens: meta.maxTokens,
+  };
+}
+
+const capitalize = (s: string): string => (s === 'xhigh' ? 'XHigh' : s[0].toUpperCase() + s.slice(1));
+
+function staticVariantLabel(family: Family, effort: Effort): string {
+  const base = family.label.replace(/ Fast$/, '');
+  return `${base} ${capitalize(effort)}${family.fast ? ' Fast' : ''}`;
+}
+
+/** Models shown before sign-in or when the catalog cannot be fetched. */
 export const FALLBACK_MODELS: ProviderModelConfig[] = [
-    makeModel('swe-1-7', 'SWE-1.7', MODEL_META.get('swe-1-7')!),
-    makeModel('swe-1-7-lightning', 'SWE-1.7 Lightning', MODEL_META.get('swe-1-7-lightning')!),
-    makeModel('gpt-5-6-sol', 'GPT-5.6 Sol', MODEL_META.get('gpt-5-6-sol')!),
-    makeModel('gpt-5-6-luna', 'GPT-5.6 Luna', MODEL_META.get('gpt-5-6-luna')!),
-    makeModel('gpt-5-6-terra', 'GPT-5.6 Terra', MODEL_META.get('gpt-5-6-terra')!),
-    makeModel('claude-opus-4-8', 'Claude Opus 4.8', MODEL_META.get('claude-opus-4-8')!),
-    makeModel('claude-fable-5', 'Claude Fable 5', MODEL_META.get('claude-fable-5')!),
-    makeModel('claude-sonnet-5', 'Claude Sonnet 5', MODEL_META.get('claude-sonnet-5')!),
-    makeModel('glm-5-2', 'GLM-5.2', MODEL_META.get('glm-5-2')!),
-    makeModel('kimi-k2-7', 'Kimi K2.7', MODEL_META.get('kimi-k2-7')!),
-    makeModel('grok-4-5', 'Grok 4.5', MODEL_META.get('grok-4-5')!),
+  ...FAMILIES.map((family) => makeModel(family.id, family.label, family, family.efforts)),
+  ...[...VARIANTS].map(([uid, { family, effort }]) =>
+    makeModel(uid, staticVariantLabel(family, effort), family, [effort]),
+  ),
 ];
 
 /**
- * Build the model list from a live catalog response.
- *
- * Filters to the 11 wanted families via {@link WANTED_PREFIXES}, skips
- * disabled entries, and stamps each with pricing/metadata from
- * {@link MODEL_META}. Falls back to {@link FALLBACK_MODELS} when the
- * catalog is null, empty, or contains none of our wanted models.
+ * Models for an account: every family with at least one enabled effort, then
+ * every enabled catalog variant of those families, with live limits and pricing.
  */
-export function buildLiveModels(catalog: CacheEntry | null): ProviderModelConfig[] {
-    if (!catalog || catalog.byUid.size === 0) {
-        return FALLBACK_MODELS;
-    }
+export function buildLiveModels(catalog: ModelCatalog): ProviderModelConfig[] {
+  const enabled = (uid: string): ModelCatalogEntry | undefined => {
+    const entry = catalog.byUid.get(uid);
+    return entry && !entry.disabled ? entry : undefined;
+  };
 
-    const models: ProviderModelConfig[] = [];
-    for (const entry of catalog.byUid.values()) {
-        if (entry.disabled) continue;
-        if (!matchesWantedPrefix(entry.modelUid)) continue;
-        const meta = findMeta(entry.modelUid) ?? DEFAULT_META;
-        models.push(makeModel(entry.modelUid, entry.label || entry.modelUid, meta));
-    }
+  const models: ProviderModelConfig[] = [];
+  for (const family of FAMILIES) {
+    const efforts = family.efforts.filter((effort) => enabled(variantUid(family, effort)));
+    if (efforts.length === 0) continue;
+    const sample = efforts.includes(DEFAULT_EFFORT) ? DEFAULT_EFFORT : efforts[0];
+    const meta = resolveMeta(family, enabled(variantUid(family, sample)));
+    models.push(makeModel(family.id, family.label, meta, efforts));
+  }
 
-    if (models.length === 0) {
-        return FALLBACK_MODELS;
-    }
+  for (const entry of catalog.byUid.values()) {
+    const family = familyOf(entry.modelUid);
+    if (!family || entry.disabled || FAMILY_BY_ID.has(entry.modelUid)) continue;
+    const pinned = VARIANTS.get(entry.modelUid)?.effort;
+    models.push(
+      makeModel(entry.modelUid, entry.label, resolveMeta(family, entry), pinned ? [pinned] : undefined),
+    );
+  }
 
-    return models;
+  return models.length > 0 ? models : FALLBACK_MODELS;
 }
-
-export { DEFAULT_HOST };

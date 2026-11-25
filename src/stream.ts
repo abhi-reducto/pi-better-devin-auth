@@ -1,341 +1,178 @@
 /**
- * pi `streamSimple` implementation for the Devin/Cognition provider.
- *
- * Calls the cloud-direct gRPC streaming layer (`streamChatEvents`) and
- * translates the resulting `CloudChatEvent` stream into pi's
- * `AssistantMessageEventStream` events.
- *
- * The async-IIFE pattern is the standard pi `streamSimple` shape: the
- * function returns a `AssistantMessageEventStream` synchronously and drives
- * the upstream async iterator inside an IIFE, pushing events as they
- * arrive.
+ * Pi `streamSimple` implementation for the Devin/Cognition provider: maps the
+ * transcript, calls the cloud-direct chat stream, retries transient failures
+ * that happen before any output, and reports the result as Pi stream events.
  */
+
+import * as crypto from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
-    type Api,
-    type AssistantMessage,
-    type AssistantMessageEventStream,
-    type Context,
-    type Model,
-    type SimpleStreamOptions,
-    calculateCost,
-    createAssistantMessageEventStream,
+  createAssistantMessageEventStream,
+  type Api,
+  type AssistantMessageEventStream,
+  type Context,
+  type Model,
+  type SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
-import { streamChatEvents, type CloudChatEvent } from './cloud-direct/index.js';
+import {
+  clearCachedUserJwt,
+  CloudAuthError,
+  CloudChatError,
+  streamChatEvents,
+  type ChatHistoryItem,
+  type CloudChatRequest,
+} from './cloud-direct/index.js';
 import { mapContextToChat } from './context-map.js';
+import { AssistantMessageBuilder } from './message-builder.js';
+import { resolveDevinTarget } from './models.js';
 
-/**
- * Stream a Devin/Cognition chat completion into pi's assistant-message
- * event stream.
- *
- * @param model     pi model descriptor (id, api, provider, cost, ...).
- * @param context   pi conversation context (systemPrompt, messages, tools).
- * @param options   streaming options (apiKey, maxTokens, signal, ...).
- * @returns an {@link AssistantMessageEventStream} that receives events
- *          as the upstream gRPC stream progresses.
- */
-export function streamDevin(
-    model: Model<Api>,
-    context: Context,
-    options?: SimpleStreamOptions,
-): AssistantMessageEventStream {
-    const stream = createAssistantMessageEventStream();
+/** What `options.onPayload` sees and may replace: the request minus credentials and transport. */
+type DevinRequestPayload = Required<
+  Pick<CloudChatRequest, 'modelUid' | 'messages' | 'cascadeId' | 'sessionId' | 'completionOpts'>
+> &
+  Pick<CloudChatRequest, 'tools'>;
 
-    // Drive the upstream async iterator inside an IIFE so the returned
-    // stream is populated asynchronously.
-    void (async () => {
-        const output: AssistantMessage = {
-            role: 'assistant',
-            content: [],
-            api: model.api,
-            provider: model.provider,
-            model: model.id,
-            usage: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-                totalTokens: 0,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            },
-            stopReason: 'stop',
-            timestamp: Date.now(),
-        };
+const DEFAULT_MAX_RETRIES = 2;
+const BASE_RETRY_DELAY_MS = 500;
+const MAX_BACKOFF_MS = 8_000;
+const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
-        // Block-tracking state. Cognition's wire format has no
-        // `tool_call_end` event, so the end of a tool call is implicit:
-        // a new `tool_call_start` or stream `finish` closes the prior call.
-        let textBlockOpen = false;
-        let thinkingBlockOpen = false;
-        let currentToolCallIndex = -1;
-        let partialJson = '';
-        let currentToolCallId = '';
-        let currentToolCallName = '';
+const RETRYABLE_CONNECT_CODES = new Set([
+  'unavailable',
+  'deadline_exceeded',
+  'resource_exhausted',
+  'internal',
+  'aborted',
+  'unknown',
+  'truncated_stream',
+]);
 
-        try {
-            const apiKey = options?.apiKey;
-            if (!apiKey) throw new Error('No Devin API key. Run /login devin');
+const isRetryableStatus = (status: number): boolean =>
+  status === 408 || status === 409 || status === 429 || status >= 500;
 
-            const { messages, tools } = mapContextToChat(context);
-            stream.push({ type: 'start', partial: output });
+/** A rejected `user_jwt`: the cached one is stale (clock skew, server-side revocation). */
+function isAuthRejection(error: unknown): boolean {
+  return error instanceof CloudChatError && (error.status === 401 || error.code === 'unauthenticated');
+}
 
-            for await (const ev of streamChatEvents({
-                apiKey,
-                modelUid: model.id,
-                messages,
-                tools: tools.length > 0 ? tools : undefined,
-                signal: options?.signal,
-                completionOpts: {
-                    maxOutputTokens: options?.maxTokens,
-                },
-            })) {
-                handleEvent(ev);
-            }
+function isRetryable(error: unknown): boolean {
+  if (isAuthRejection(error)) return true;
+  if (error instanceof CloudChatError) {
+    return error.status !== undefined
+      ? isRetryableStatus(error.status)
+      : error.code !== undefined && RETRYABLE_CONNECT_CODES.has(error.code);
+  }
+  if (error instanceof CloudAuthError) {
+    return error.status !== undefined && isRetryableStatus(error.status);
+  }
+  // fetch reports network failures as TypeError("fetch failed") and an
+  // elapsed AbortSignal.timeout as a TimeoutError.
+  return error instanceof Error && (error.name === 'TimeoutError' || error.message === 'fetch failed');
+}
 
-            // Safety: close any still-open blocks at stream end.
-            closeTextBlock();
-            closeThinkingBlock();
-            if (currentToolCallIndex >= 0) {
-                closeToolCall(
-                    stream,
-                    output,
-                    currentToolCallIndex,
-                    partialJson,
-                    currentToolCallId,
-                    currentToolCallName,
-                );
-                currentToolCallIndex = -1;
-            }
-
-            stream.push({
-                type: 'done',
-                reason: output.stopReason as 'stop' | 'length' | 'toolUse',
-                message: output,
-            });
-            stream.end();
-        } catch (error) {
-            output.stopReason = options?.signal?.aborted ? 'aborted' : 'error';
-            output.errorMessage = error instanceof Error ? error.message : String(error);
-            stream.push({
-                type: 'error',
-                reason: output.stopReason as 'aborted' | 'error',
-                error: output,
-            });
-            stream.end();
-        }
-
-        /**
-         * Dispatch a single {@link CloudChatEvent} to the appropriate
-         * pi event(s), mutating `output` and the block-tracking state.
-         */
-        function handleEvent(ev: CloudChatEvent): void {
-            switch (ev.kind) {
-                case 'text': {
-                    // A text delta ends any open thinking block.
-                    closeThinkingBlock();
-                    if (!textBlockOpen) {
-                        output.content.push({ type: 'text', text: '' });
-                        stream.push({
-                            type: 'text_start',
-                            contentIndex: output.content.length - 1,
-                            partial: output,
-                        });
-                        textBlockOpen = true;
-                    }
-                    const idx = output.content.length - 1;
-                    const block = output.content[idx];
-                    if (block.type === 'text') {
-                        block.text += ev.text;
-                        stream.push({
-                            type: 'text_delta',
-                            contentIndex: idx,
-                            delta: ev.text,
-                            partial: output,
-                        });
-                    }
-                    break;
-                }
-
-                case 'reasoning': {
-                    // A reasoning delta ends any open text block.
-                    closeTextBlock();
-                    if (!thinkingBlockOpen) {
-                        output.content.push({ type: 'thinking', thinking: '' });
-                        stream.push({
-                            type: 'thinking_start',
-                            contentIndex: output.content.length - 1,
-                            partial: output,
-                        });
-                        thinkingBlockOpen = true;
-                    }
-                    const idx = output.content.length - 1;
-                    const block = output.content[idx];
-                    if (block.type === 'thinking') {
-                        block.thinking += ev.text;
-                        stream.push({
-                            type: 'thinking_delta',
-                            contentIndex: idx,
-                            delta: ev.text,
-                            partial: output,
-                        });
-                    }
-                    break;
-                }
-
-                case 'tool_call_start': {
-                    // A new tool call ends any open text/thinking block,
-                    // and implicitly closes the previous tool call.
-                    closeTextBlock();
-                    closeThinkingBlock();
-                    if (currentToolCallIndex >= 0) {
-                        closeToolCall(
-                            stream,
-                            output,
-                            currentToolCallIndex,
-                            partialJson,
-                            currentToolCallId,
-                            currentToolCallName,
-                        );
-                    }
-                    currentToolCallId = ev.id;
-                    currentToolCallName = ev.name;
-                    partialJson = '';
-                    output.content.push({
-                        type: 'toolCall',
-                        id: ev.id,
-                        name: ev.name,
-                        arguments: {},
-                    });
-                    currentToolCallIndex = output.content.length - 1;
-                    stream.push({
-                        type: 'toolcall_start',
-                        contentIndex: currentToolCallIndex,
-                        partial: output,
-                    });
-                    break;
-                }
-
-                case 'tool_call_args': {
-                    // Defensive: args without a preceding start should not
-                    // happen on Cognition's wire format — ignore them.
-                    if (currentToolCallIndex < 0) break;
-                    partialJson += ev.argsDelta;
-                    const block = output.content[currentToolCallIndex];
-                    if (block.type === 'toolCall') {
-                        try {
-                            block.arguments = JSON.parse(partialJson);
-                        } catch {
-                            // Incomplete JSON — keep accumulating deltas.
-                        }
-                    }
-                    stream.push({
-                        type: 'toolcall_delta',
-                        contentIndex: currentToolCallIndex,
-                        delta: ev.argsDelta,
-                        partial: output,
-                    });
-                    break;
-                }
-
-                case 'finish': {
-                    closeTextBlock();
-                    closeThinkingBlock();
-                    if (currentToolCallIndex >= 0) {
-                        closeToolCall(
-                            stream,
-                            output,
-                            currentToolCallIndex,
-                            partialJson,
-                            currentToolCallId,
-                            currentToolCallName,
-                        );
-                        currentToolCallIndex = -1;
-                    }
-                    output.stopReason =
-                        ev.reason === 'tool_calls'
-                            ? 'toolUse'
-                            : ev.reason === 'length'
-                              ? 'length'
-                              : 'stop';
-                    break;
-                }
-
-                case 'usage': {
-                    output.usage.input = ev.promptTokens ?? 0;
-                    output.usage.output = ev.completionTokens ?? 0;
-                    output.usage.cacheRead = ev.cachedInputTokens ?? 0;
-                    output.usage.cacheWrite = ev.cacheCreationInputTokens ?? 0;
-                    output.usage.totalTokens =
-                        ev.totalTokens ?? output.usage.input + output.usage.output;
-                    // calculateCost mutates output.usage.cost in place.
-                    calculateCost(model, output.usage);
-                    break;
-                }
-            }
-        }
-
-        /** Close the open text block, if any, emitting `text_end`. */
-        function closeTextBlock(): void {
-            if (!textBlockOpen) return;
-            const idx = output.content.length - 1;
-            const block = output.content[idx];
-            if (block.type === 'text') {
-                stream.push({
-                    type: 'text_end',
-                    contentIndex: idx,
-                    content: block.text,
-                    partial: output,
-                });
-            }
-            textBlockOpen = false;
-        }
-
-        /** Close the open thinking block, if any, emitting `thinking_end`. */
-        function closeThinkingBlock(): void {
-            if (!thinkingBlockOpen) return;
-            const idx = output.content.length - 1;
-            const block = output.content[idx];
-            if (block.type === 'thinking') {
-                stream.push({
-                    type: 'thinking_end',
-                    contentIndex: idx,
-                    content: block.thinking,
-                    partial: output,
-                });
-            }
-            thinkingBlockOpen = false;
-        }
-    })();
-
-    return stream;
+function retryDelayMs(error: unknown, attempt: number, maxDelayMs: number): number {
+  const backoff = Math.min(BASE_RETRY_DELAY_MS * 2 ** attempt, MAX_BACKOFF_MS);
+  const jittered = backoff * (0.75 + Math.random() * 0.25);
+  const requested = error instanceof CloudChatError ? (error.retryAfterMs ?? 0) : 0;
+  return Math.min(Math.max(jittered, requested), maxDelayMs);
 }
 
 /**
- * Close a tool-call block: attempt a final JSON parse of the accumulated
- * args delta and emit `toolcall_end` with the resolved {@link ToolCall}.
- *
- * Defined at module scope so it is hoisted and usable from the IIFE
- * closure without forward-reference concerns.
+ * Cognition keys its prompt cache on the conversation's session and cascade
+ * ids, so they must be stable across turns and across process restarts.
+ * Derive them from Pi's session id, or failing that from the first user
+ * message, which is the same on every turn of a conversation.
  */
-function closeToolCall(
-    stream: AssistantMessageEventStream,
-    output: AssistantMessage,
-    index: number,
-    partialJson: string,
-    id: string,
-    name: string,
-): void {
-    const block = output.content[index];
-    if (block.type !== 'toolCall') return;
-    // One last parse attempt in case the final delta completed the JSON.
-    try {
-        block.arguments = JSON.parse(partialJson);
-    } catch {
-        // Leave arguments as the last successfully-parsed value (or `{}`).
+function conversationIds(
+  sessionId: string | undefined,
+  messages: ChatHistoryItem[],
+): { sessionId: string; cascadeId: string } {
+  const firstUser = messages.find((m) => m.role === 'user');
+  const seed = sessionId ?? JSON.stringify(firstUser?.content ?? '').slice(0, 4096);
+  const uuid = (namespace: string): string => {
+    const bytes = crypto.createHash('sha256').update(`${namespace}\0${seed}`).digest().subarray(0, 16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50; // version 5
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    const hex = bytes.toString('hex');
+    return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+  };
+  return { sessionId: uuid('pi-devin-session'), cascadeId: uuid('pi-devin-cascade') };
+}
+
+/**
+ * Pi triggers auto-compaction by matching known overflow phrasings. Rephrase
+ * the overflow errors it would not recognize into one it does.
+ */
+function describeError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return /context[_ -]?length|too many tokens|maximum context|token limit/i.test(message)
+    ? `Context window exceeded: ${message}`
+    : message;
+}
+
+export function streamDevin(
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions = {},
+): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+  const target = resolveDevinTarget(model.id, options.reasoning);
+  const builder = new AssistantMessageBuilder(stream, model, target);
+
+  const run = async (): Promise<void> => {
+    const apiKey = options.apiKey;
+    if (!apiKey) throw new Error('Not signed in to Devin. Run /login devin');
+
+    const { messages, tools } = mapContextToChat(context);
+    let payload: DevinRequestPayload = {
+      modelUid: target.modelUid,
+      messages,
+      tools: tools.length > 0 ? tools : undefined,
+      ...conversationIds(options.sessionId, messages),
+      completionOpts: {
+        maxOutputTokens: options.maxTokens ?? model.maxTokens,
+        maxInputTokens: model.contextWindow,
+        temperature: options.temperature,
+      },
+    };
+    const replaced = await options.onPayload?.(payload, model);
+    if (replaced && typeof replaced === 'object') payload = replaced as DevinRequestPayload;
+
+    const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+    const maxRetryDelayMs = options.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
+
+    for (let attempt = 0; ; attempt++) {
+      let receivedOutput = false;
+      try {
+        const events = streamChatEvents({
+          ...payload,
+          apiKey,
+          apiServerUrl: model.baseUrl,
+          fetch: options.fetch,
+          headers: options.headers,
+          onResponse: (response) => options.onResponse?.(response, model),
+          signal: options.signal,
+        });
+        for await (const ev of events) {
+          receivedOutput = true;
+          await options.onProviderStreamEvent?.(ev, model);
+          builder.apply(ev);
+        }
+        return;
+      } catch (error) {
+        // Once output has streamed, a retry would duplicate it.
+        const canRetry =
+          !receivedOutput && !options.signal?.aborted && attempt < maxRetries && isRetryable(error);
+        if (!canRetry) throw error;
+        if (isAuthRejection(error)) clearCachedUserJwt();
+        await sleep(retryDelayMs(error, attempt, maxRetryDelayMs), undefined, { signal: options.signal });
+      }
     }
-    stream.push({
-        type: 'toolcall_end',
-        contentIndex: index,
-        toolCall: { type: 'toolCall', id, name, arguments: block.arguments },
-        partial: output,
-    });
+  };
+
+  run().then(
+    () => builder.finish(),
+    (error) => builder.fail(describeError(error), options.signal?.aborted ?? false),
+  );
+  return stream;
 }

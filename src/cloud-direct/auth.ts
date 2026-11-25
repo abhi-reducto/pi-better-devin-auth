@@ -1,246 +1,126 @@
 /**
- * Mint the short-lived `user_jwt` that every chat RPC needs alongside the
- * persistent OAuth-issued `api_key`.
+ * Short-lived `user_jwt` minting and stale-while-revalidate cache via
+ * `exa.auth_pb.AuthService/GetUserJwt`.
  *
- *   POST https://server.codeium.com/exa.auth_pb.AuthService/GetUserJwt
- *   Content-Type: application/proto             ← unary, NOT streaming
- *   Body: GetUserJwtRequest { metadata: Metadata }
- *   Response: GetUserJwtResponse { user_jwt: string }  (field 1)
- *
- * The returned JWT has a payload like:
- *   {
- *     "api_key": "devin-synthetic-apikey$account-…$user-…",
- *     "auth_uid": "devin-auth-uid$…",
- *     "email": "user@example.com",
- *     "exp": <unix-seconds>,         ← ~24 minute TTL
- *     "pro": true,
- *     "teams_tier": "TEAMS_TIER_DEVIN_PRO",
- *     ...
- *   }
- *
- * The JWT is signed HS256 by the server — can't be forged client-side. We
- * cache it and refresh shortly before `exp`.
+ * The JWT lives in memory only. Concurrent callers share one in-flight mint,
+ * which is why a mint is bounded by its own timeout rather than by any one
+ * caller's abort signal.
  */
 
-import * as crypto from 'crypto';
-import { encodeMessage, iterFields } from './wire.js';
 import { buildMetadata } from './metadata.js';
-
-const DEFAULT_HOST = 'https://server.codeium.com';
-
-/**
- * Polyfill for `AbortSignal.any` — composes multiple signals so the result
- * aborts when ANY input aborts. Built-in in Node ≥20.3 / Bun ≥1.0. Our
- * `engines.node` is `>=18.0.0`, so we ship the fallback ourselves; without
- * it the caller's cancel signal silently disappears on older runtimes
- * (chat-cancel during a `GetUserJwt` mint would keep the network request
- * alive for up to the full 30s timeout).
- */
-function anySignal(signals: AbortSignal[]): AbortSignal {
-  const builtin = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
-  if (typeof builtin === 'function') return builtin(signals);
-  const controller = new AbortController();
-  const onAbort = (reason: unknown): void => {
-    if (!controller.signal.aborted) controller.abort(reason);
-  };
-  for (const s of signals) {
-    if (s.aborted) {
-      onAbort(s.reason);
-      break;
-    }
-    s.addEventListener('abort', () => onAbort(s.reason), { once: true });
-  }
-  return controller.signal;
-}
-
-export interface MintedUserJwt {
-  jwt: string;
-  /** Unix epoch seconds when the JWT expires. */
-  expiresAt: number;
-}
+import { encodeMessage, fieldString, iterFields } from './wire.js';
+import {
+  accountKey,
+  decodeJwtPayload,
+  normalizeHost,
+  timeoutSignal,
+  UNARY_PROTO_HEADERS,
+  type FetchFn,
+} from './utils.js';
 
 export class CloudAuthError extends Error {
-  constructor(message: string, public readonly status?: number) {
+  constructor(
+    message: string,
+    public readonly status?: number,
+  ) {
     super(message);
     this.name = 'CloudAuthError';
   }
 }
 
-/**
- * Default mint timeout — 30s is generous (the endpoint responds in ~200ms
- * in steady state) but enough headroom for slow networks. Callers can pass
- * a tighter `signal` to override.
- */
-const MINT_TIMEOUT_MS = 30_000;
+interface MintedUserJwt {
+  jwt: string;
+  /** Unix epoch seconds when the JWT expires. */
+  expiresAt: number;
+}
 
-/**
- * Mint a fresh user_jwt by calling exa.auth_pb.AuthService/GetUserJwt.
- * `host` defaults to https://server.codeium.com — pass your tenant URL if your
- * RegisterUser response gave a different host.
- *
- * Always applies an internal 30s timeout so a network stall here can't
- * deadlock every concurrent chat request. If the caller passes a `signal`,
- * we honor whichever fires first via AbortSignal.any.
- */
-export async function mintUserJwt(
-  apiKey: string,
-  host: string = DEFAULT_HOST,
-  signal?: AbortSignal,
-): Promise<MintedUserJwt> {
-  const metadata = buildMetadata({
-    apiKey,
-    sessionId: crypto.randomUUID(),
-    requestId: BigInt(Date.now()),
-    triggerId: crypto.randomUUID(),
-  });
-  // GetUserJwtRequest { metadata: Metadata }   — Metadata is field 1
-  const req = encodeMessage(1, metadata);
+const MINT_TIMEOUT_MS = 15_000;
+/** Block and mint if less than this remains. */
+const HARD_REFRESH_MARGIN_SEC = 60;
+/** Serve the cached JWT but refresh in the background if less than this remains. */
+const SOFT_REFRESH_MARGIN_SEC = 300;
+/** Assumed lifetime when the JWT carries no usable `exp`. */
+const FALLBACK_TTL_SEC = 600;
+const JWT_SHAPE_RE = /^eyJ[A-Za-z0-9_-]{10,}={0,2}\.[A-Za-z0-9_-]+={0,2}\.[A-Za-z0-9_-]+={0,2}$/;
 
-  // Compose caller signal with our internal timeout via `anySignal` — a
-  // small polyfill of `AbortSignal.any` for runtimes (Node 18 / older
-  // Bun) that lack the built-in. The previous fallback silently dropped
-  // the CALLER's signal on those runtimes, so a chat-cancel during a
-  // GetUserJwt mint would keep the network request alive for up to the
-  // full 30s timeout.
-  const timeoutSignal = AbortSignal.timeout(MINT_TIMEOUT_MS);
-  const combinedSignal: AbortSignal = signal
-    ? anySignal([signal, timeoutSignal])
-    : timeoutSignal;
+const nowSec = (): number => Math.floor(Date.now() / 1000);
 
-  const resp = await fetch(`${host.replace(/\/$/, '')}/exa.auth_pb.AuthService/GetUserJwt`, {
+async function mintUserJwt(apiKey: string, host: string, fetchFn: FetchFn): Promise<MintedUserJwt> {
+  const resp = await fetchFn(`${host}/exa.auth_pb.AuthService/GetUserJwt`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/proto',
-      'Connect-Protocol-Version': '1',
-    },
-    body: req,
-    signal: combinedSignal,
+    headers: UNARY_PROTO_HEADERS,
+    body: new Uint8Array(encodeMessage(1, buildMetadata({ apiKey }))),
+    signal: timeoutSignal(MINT_TIMEOUT_MS),
   });
   const buf = Buffer.from(await resp.arrayBuffer());
-
   if (!resp.ok) {
-    const text = buf.toString('utf8');
-    throw new CloudAuthError(`GetUserJwt HTTP ${resp.status}: ${text.slice(0, 400)}`, resp.status);
+    throw new CloudAuthError(
+      `GetUserJwt HTTP ${resp.status}: ${buf.toString('utf8').slice(0, 400)}`,
+      resp.status,
+    );
   }
 
-  // Response is GetUserJwtResponse { user_jwt: string } where user_jwt is
-  // field 1, length-delimited. Decode the field properly instead of
-  // regex-scanning the whole buffer — the previous regex would pick up
-  // any JWT-shaped substring in the response (trace IDs, signature
-  // headers, any cached token inadvertently logged) and could even land
-  // on a non-user_jwt if Cognition ever embeds another JWT in a sibling
-  // field.
-  let jwt: string | null = null;
+  let jwt: string | undefined;
   for (const f of iterFields(buf)) {
-    if (f.num === 1 && f.wire === 2 && Buffer.isBuffer(f.value)) {
-      const s = (f.value as Buffer).toString('utf8');
-      // Sanity-check the shape — defensive: if the cloud ever moves user_jwt
-      // out from field 1 we want a clean error, not silently wrong creds.
-      // base64url with OPTIONAL `=` padding on each segment. Most modern
-      // JWTs omit the `=`, but the spec allows it and a future server-side
-      // change could re-introduce it; either way it's still a valid token.
-      if (/^eyJ[A-Za-z0-9_-]{10,}={0,2}\.[A-Za-z0-9_-]+={0,2}\.[A-Za-z0-9_-]+={0,2}$/.test(s)) {
-        jwt = s;
-        break;
-      }
+    const s = fieldString(f, 1);
+    if (s && JWT_SHAPE_RE.test(s)) {
+      jwt = s;
+      break;
     }
   }
   if (!jwt) {
-    throw new CloudAuthError(
-      `GetUserJwt 200 but no field-1 JWT found (${buf.length} bytes): ${buf.toString('utf8').slice(0, 200)}`,
-    );
+    throw new CloudAuthError(`GetUserJwt returned HTTP 200 without a JWT (${buf.length} bytes)`);
   }
 
-  // Decode the payload to get the expiry.
-  let expiresAt = Math.floor(Date.now() / 1000) + 600;   // fallback: 10 min
-  try {
-    const parts = jwt.split('.');
-    const pad = (s: string) => s + '='.repeat((4 - (s.length % 4)) % 4);
-    const payload = JSON.parse(
-      Buffer.from(pad(parts[1]).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'),
-    );
-    if (typeof payload.exp === 'number') expiresAt = payload.exp;
-  } catch { /* fall back to default */ }
-
+  const exp = decodeJwtPayload(jwt)?.exp;
+  const expiresAt = typeof exp === 'number' && Number.isFinite(exp) ? exp : nowSec() + FALLBACK_TTL_SEC;
   return { jwt, expiresAt };
 }
 
-// ----------------------------------------------------------------------------
-// In-memory cache — refresh ~60s before expiry
-// ----------------------------------------------------------------------------
-
-interface CacheEntry {
-  jwt: string;
-  expiresAt: number;
-  apiKey: string;
-  host: string;
-}
-
-/**
- * Cache is keyed by (apiKey, host). A single shared `cache` slot only holds
- * the MOST RECENTLY USED entry — common case is one account at a time, so
- * a single slot is enough. inFlight is a per-key map so a JWT mint for
- * account A doesn't get returned to a concurrent request for account B.
- *
- * Previously `inFlight` was a singleton — if account A's mint was in flight
- * and a request for account B arrived, B got A's JWT. That's the M1
- * "concurrent requests after account switch get wrong JWT" bug.
- */
-let cache: CacheEntry | null = null;
+const cache = new Map<string, MintedUserJwt>();
 const inFlight = new Map<string, Promise<MintedUserJwt>>();
-/**
- * Monotonic epoch counter. Incremented on every `clearCachedUserJwt()`
- * call so an in-flight mint that started BEFORE the clear can't
- * repopulate the cache after-the-fact. Without this, a logout that
- * happened concurrently with a mint would silently get its just-
- * invalidated JWT cached and served for the next ~24 minutes.
- */
+/** Bumped on clear so a mint that started before the clear cannot repopulate the cache. */
 let cacheEpoch = 0;
 
-function flightKey(apiKey: string, host: string): string {
-  return `${host}\x1f${apiKey}`;
-}
-
-/**
- * Get a cached user_jwt or mint a new one. Refreshes when the cached JWT is
- * within 60s of expiry. Multiple concurrent callers for the SAME (apiKey, host)
- * share the same in-flight mint; concurrent callers for DIFFERENT keys each
- * get their own mint.
- */
-export async function getCachedUserJwt(apiKey: string, host: string = DEFAULT_HOST, signal?: AbortSignal): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  if (cache && cache.apiKey === apiKey && cache.host === host && cache.expiresAt > now + 60) {
-    return cache.jwt;
-  }
-  const key = flightKey(apiKey, host);
+function startMint(key: string, apiKey: string, host: string, fetchFn: FetchFn): Promise<MintedUserJwt> {
   const existing = inFlight.get(key);
-  if (existing) return (await existing).jwt;
-  const promise = mintUserJwt(apiKey, host, signal);
-  inFlight.set(key, promise);
-  // Snapshot the epoch BEFORE awaiting the mint. If clearCachedUserJwt()
-  // fires while we're awaiting (logout-during-mint), the epoch changes
-  // and we won't repopulate the cache with the just-invalidated JWT.
+  if (existing) return existing;
+
   const epochAtStart = cacheEpoch;
-  try {
-    const minted = await promise;
-    if (cacheEpoch === epochAtStart) {
-      cache = { jwt: minted.jwt, expiresAt: minted.expiresAt, apiKey, host };
-    }
-    return minted.jwt;
-  } finally {
-    inFlight.delete(key);
-  }
+  const promise = mintUserJwt(apiKey, host, fetchFn)
+    .then((minted) => {
+      if (cacheEpoch === epochAtStart) cache.set(key, minted);
+      return minted;
+    })
+    .finally(() => {
+      if (inFlight.get(key) === promise) inFlight.delete(key);
+    });
+  inFlight.set(key, promise);
+  return promise;
 }
 
-/**
- * Drop the in-memory JWT cache. Call after credential changes (logout,
- * account switch) so long-running opencode processes don't keep using a
- * JWT minted from a now-invalid api_key. Also bumps the cache epoch so
- * any in-flight mint racing with this clear can't repopulate cache
- * with the stale JWT after-the-fact.
- */
+/** A valid `user_jwt` for this account, minting or refreshing it as needed. */
+export async function getCachedUserJwt(
+  apiKey: string,
+  host?: string,
+  fetchFn: FetchFn = globalThis.fetch,
+): Promise<string> {
+  const baseUrl = normalizeHost(host);
+  const key = accountKey(apiKey, baseUrl);
+  const cached = cache.get(key);
+  const now = nowSec();
+
+  if (cached && cached.expiresAt > now + HARD_REFRESH_MARGIN_SEC) {
+    if (cached.expiresAt <= now + SOFT_REFRESH_MARGIN_SEC) {
+      startMint(key, apiKey, baseUrl, fetchFn).catch(() => {});
+    }
+    return cached.jwt;
+  }
+  return (await startMint(key, apiKey, baseUrl, fetchFn)).jwt;
+}
+
 export function clearCachedUserJwt(): void {
-  cache = null;
+  cache.clear();
   inFlight.clear();
   cacheEpoch++;
 }

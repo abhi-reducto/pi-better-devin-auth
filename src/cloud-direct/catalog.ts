@@ -1,229 +1,45 @@
 /**
- * Per-account model catalog from Cognition's `GetCascadeModelConfigs`.
+ * Per-account model catalog lookup via `GetCascadeModelConfigs`.
  *
- * Why this exists — issue #14:
- *   The cloud's `GetChatMessage` returns a single Connect-streaming EOS frame
- *   containing `{"error":{"code":"permission_denied","message":"an internal
- *   error occurred (trace ID: <hex>)"}}` whenever the caller's account tier
- *   does not include the requested `model_uid`. Reproduced byte-identical on a
- *   `TEAMS_TIER_DEVIN_FREE` account for every Anthropic/Gemini/Premium UID
- *   (only `swe-1-6-slow` streamed a real reply). The user-facing message is
- *   indistinguishable from a transient server fault — issue #14's reporter
- *   spent multiple sessions guessing.
- *
- *   The pre-flight here checks the per-account catalog (`disabled` flag on
- *   `ClientModelConfig` field #4) BEFORE we spend a roundtrip on a request
- *   the cloud will refuse. When the lookup fails (network, auth, schema
- *   drift) we silently fall back to the chat path so a transient catalog
- *   outage can't take chat down with it.
- *
- * Schema (verified against the bundled `extension.js`,
- * `exa.codeium_common_pb.ClientModelConfig`):
- *
- *   GetCascadeModelConfigsResponse {
- *     #1 client_model_configs: repeated ClientModelConfig
- *   }
- *   ClientModelConfig {
- *     #1  label                string
- *     #4  disabled             bool   ← the gate this module reads
- *     #22 model_uid            string ← what `GetChatMessage` accepts
- *   }
- *
- *   Disabled semantics: TRUE means "this UID exists in the catalog but the
- *   caller's account/tier cannot run inference against it." BYOK models
- *   surface as `disabled: false` so users with their own provider keys still
- *   pass through — the only way they fail at chat time is a missing key,
- *   which surfaces with a different message.
- *
- * Cache: per (apiServerUrl, apiKey) for {@link CATALOG_TTL_MS}. Cognition
- * doesn't bump catalog entries mid-session in normal operation, so a 10-min
- * TTL trades one extra roundtrip per ~10 min for clear errors on every chat.
+ * Parses `exa.codeium_common_pb.ClientModelConfig`:
+ *   #1  label                string
+ *   #4  disabled             bool
+ *   #18 max_context_tokens   uint64
+ *   #22 model_uid            string
+ *   #23 model_info           { #13 max_output_tokens, #23 base_model_id }
+ *   #32 pricing_entries      repeated { #1 label, #2 price_usd_per_m (float32) }
  */
 
-import * as crypto from 'crypto';
-import { buildMetadata } from './metadata.js';
 import { getCachedUserJwt } from './auth.js';
-import { encodeMessage, iterFields } from './wire.js';
+import { buildMetadata } from './metadata.js';
+import { encodeMessage, fieldBytes, fieldFloat, fieldString, fieldVarint, iterFields } from './wire.js';
+import { accountKey, normalizeHost, timeoutSignal, UNARY_PROTO_HEADERS, type FetchFn } from './utils.js';
 
-/** 10 minutes — see header. */
-const CATALOG_TTL_MS = 10 * 60 * 1000;
-
-/** Catalog endpoint inactivity timeout. Cognition responds in <500ms steady-state. */
+const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
 const CATALOG_FETCH_TIMEOUT_MS = 10_000;
 
-export interface ModelCatalogEntry {
-  /** Cloud-side `model_uid` (e.g. `claude-opus-4-7-medium`). */
-  modelUid: string;
-  /** Human label (e.g. `Claude Opus 4.7 Medium`) — used in error messages. */
-  label: string;
-  /** True when the caller's account tier cannot use this UID for chat. */
-  disabled: boolean;
+export interface ModelCatalogPricing {
+  /** USD per million tokens. */
+  input?: number;
+  cachedInput?: number;
+  output?: number;
 }
 
-export interface CacheEntry {
-  /** Lookup keyed by `model_uid`. */
+export interface ModelCatalogEntry {
+  modelUid: string;
+  label: string;
+  disabled: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
+  baseModelId?: string;
+  pricing?: ModelCatalogPricing;
+}
+
+export interface ModelCatalog {
   byUid: Map<string, ModelCatalogEntry>;
   fetchedAt: number;
-  /** Cache key components, captured for invalidation/log purposes. */
-  apiKey: string;
-  host: string;
 }
 
-let cached: CacheEntry | null = null;
-let inFlight: Promise<CacheEntry> | null = null;
-let inFlightKey: string | null = null;
-
-function flightKey(apiKey: string, host: string): string {
-  return `${host}\x1f${apiKey}`;
-}
-
-/**
- * Fetch the cascade model catalog for `(apiKey, host)` and parse the
- * subset of `ClientModelConfig` we care about into a UID-keyed map.
- *
- * Throws on transport/auth failure so the caller can decide whether to fall
- * back to "skip pre-flight". Does NOT throw on an unexpected response body —
- * a malformed catalog returns an empty map, treated the same as "model not
- * listed" by the chat pre-flight.
- */
-async function fetchCatalog(apiKey: string, host: string, signal?: AbortSignal): Promise<CacheEntry> {
-  const userJwt = await getCachedUserJwt(apiKey, host, signal);
-
-  const metadata = buildMetadata({
-    apiKey,
-    userJwt,
-    sessionId: crypto.randomUUID(),
-    requestId: BigInt(Date.now()),
-    triggerId: crypto.randomUUID(),
-  });
-  // GetCascadeModelConfigsRequest { metadata: Metadata }  — Metadata is #1.
-  const reqBody = encodeMessage(1, metadata);
-
-  // Internal 10s timeout so a stalled catalog endpoint can't deadlock chat.
-  // The caller's signal still takes precedence — when they cancel, we cancel.
-  const ac = new AbortController();
-  const timer = setTimeout(
-    () => ac.abort(new Error(`catalog: fetch timeout (${CATALOG_FETCH_TIMEOUT_MS}ms)`)),
-    CATALOG_FETCH_TIMEOUT_MS,
-  );
-  const cleanupOnAbort = signal
-    ? (() => {
-        if (signal.aborted) ac.abort(signal.reason);
-        const fwd = (): void => ac.abort(signal.reason);
-        signal.addEventListener('abort', fwd, { once: true });
-        return () => signal.removeEventListener('abort', fwd);
-      })()
-    : (): void => { /* no caller signal */ };
-
-  let resp: Response;
-  try {
-    resp = await fetch(`${host}/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/proto', 'Connect-Protocol-Version': '1' },
-      body: reqBody,
-      signal: ac.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-    cleanupOnAbort();
-  }
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`GetCascadeModelConfigs HTTP ${resp.status}: ${text.slice(0, 200)}`);
-  }
-  const buf = Buffer.from(await resp.arrayBuffer());
-
-  // GetCascadeModelConfigsResponse #1 (repeated ClientModelConfig)
-  const byUid = new Map<string, ModelCatalogEntry>();
-  for (const f of iterFields(buf)) {
-    if (f.num !== 1 || f.wire !== 2 || !Buffer.isBuffer(f.value)) continue;
-    let label = '';
-    let modelUid = '';
-    let disabled = false;
-    for (const sf of iterFields(f.value as Buffer)) {
-      if (sf.num === 1 && sf.wire === 2 && Buffer.isBuffer(sf.value)) {
-        label = (sf.value as Buffer).toString('utf8');
-      } else if (sf.num === 4 && sf.wire === 0) {
-        // #4 = disabled (bool, varint 0/1)
-        disabled = sf.value === 1n;
-      } else if (sf.num === 22 && sf.wire === 2 && Buffer.isBuffer(sf.value)) {
-        modelUid = (sf.value as Buffer).toString('utf8');
-      }
-    }
-    if (modelUid.length > 0) {
-      byUid.set(modelUid, { modelUid, label: label || modelUid, disabled });
-    }
-  }
-
-  return { byUid, fetchedAt: Date.now(), apiKey, host };
-}
-
-/**
- * Get the cached catalog for `(apiKey, host)`, fetching when missing or stale.
- *
- * Concurrent callers for the SAME (apiKey, host) share one in-flight fetch
- * (no thundering herd on startup). Concurrent callers for DIFFERENT keys
- * serialise the in-flight slot but only one of them holds it at a time —
- * good enough for opencode's single-account-at-a-time usage pattern.
- *
- * Returns `null` on fetch failure (network, transient 5xx, auth issue). The
- * caller treats `null` as "skip pre-flight and let the chat path surface the
- * server-side error itself."
- */
-export async function getCachedCatalog(
-  apiKey: string,
-  host: string,
-  signal?: AbortSignal,
-): Promise<CacheEntry | null> {
-  if (cached && cached.apiKey === apiKey && cached.host === host) {
-    if (Date.now() - cached.fetchedAt < CATALOG_TTL_MS) {
-      return cached;
-    }
-  }
-
-  const key = flightKey(apiKey, host);
-  if (inFlight && inFlightKey === key) {
-    try {
-      return await inFlight;
-    } catch {
-      return null;
-    }
-  }
-
-  const promise = fetchCatalog(apiKey, host, signal);
-  inFlight = promise;
-  inFlightKey = key;
-  try {
-    const result = await promise;
-    cached = result;
-    return result;
-  } catch {
-    return null;
-  } finally {
-    if (inFlight === promise) {
-      inFlight = null;
-      inFlightKey = null;
-    }
-  }
-}
-
-/**
- * Drop the cached catalog. Call after logout/account switch so a fresh
- * sign-in doesn't see a previous account's allow-list.
- */
-export function clearCachedCatalog(): void {
-  cached = null;
-  inFlight = null;
-  inFlightKey = null;
-}
-
-/**
- * Tier-disabled error — thrown by the chat pre-flight when the catalog lists
- * a model as `disabled: true` for this account. The message names the model
- * and points at the plan page, replacing Cognition's opaque
- * "an internal error occurred" trailer.
- */
 export class ModelNotAvailableError extends Error {
   constructor(
     public readonly modelUid: string,
@@ -232,15 +48,144 @@ export class ModelNotAvailableError extends Error {
   ) {
     super(
       reason === 'disabled'
-        ? `Model "${label}" (uid=${modelUid}) is not enabled for your Cognition account. ` +
-          `The Cognition catalog returned it with disabled=true — meaning your current plan/tier ` +
-          `does not include this model. ` +
-          `Check the model picker on https://codeium.com/account, or pick a different model. ` +
-          `(This message replaces Cognition's "an internal error occurred" — same root cause.)`
-        : `Model uid "${modelUid}" is not listed in the Cognition catalog for your account. ` +
-          `Either the UID has been retired upstream or your account/region doesn't serve it. ` +
-          `Run \`curl http://127.0.0.1:42100/v1/models\` to see the canonical names your plan accepts.`,
+        ? `Model "${label}" (uid=${modelUid}) is not enabled for your Cognition account. Check https://codeium.com/account or pick a different model.`
+        : `Model uid "${modelUid}" is not listed in the Cognition catalog for your account. Run /devin-refresh to refresh available models.`,
     );
     this.name = 'ModelNotAvailableError';
   }
+}
+
+const positive = (n: number | undefined): number | undefined =>
+  n !== undefined && Number.isFinite(n) && n > 0 ? n : undefined;
+
+function parsePricingEntry(buf: Buffer): { label: string; usdPerMillion: number } | null {
+  let label = '';
+  let price: number | undefined;
+  for (const f of iterFields(buf)) {
+    label = fieldString(f, 1) ?? label;
+    const v = fieldFloat(f, 2);
+    // float32 on the wire: round away the representation noise (3.0000001 -> 3).
+    if (v !== undefined && Number.isFinite(v) && v >= 0) price = Math.round(v * 10_000) / 10_000;
+  }
+  return label && price !== undefined ? { label, usdPerMillion: price } : null;
+}
+
+function parseClientModelConfig(buf: Buffer): ModelCatalogEntry | null {
+  const entry: ModelCatalogEntry = { modelUid: '', label: '', disabled: false };
+
+  for (const f of iterFields(buf)) {
+    entry.label = fieldString(f, 1) ?? entry.label;
+    entry.modelUid = fieldString(f, 22) ?? entry.modelUid;
+    if (fieldVarint(f, 4) !== undefined) entry.disabled = fieldVarint(f, 4) === 1;
+    entry.contextWindow = positive(fieldVarint(f, 18)) ?? entry.contextWindow;
+
+    const info = fieldBytes(f, 23);
+    if (info) {
+      for (const sf of iterFields(info)) {
+        entry.maxTokens = positive(fieldVarint(sf, 13)) ?? entry.maxTokens;
+        entry.baseModelId = fieldString(sf, 23) || entry.baseModelId;
+      }
+    }
+
+    const pricingBytes = fieldBytes(f, 32);
+    const price = pricingBytes && parsePricingEntry(pricingBytes);
+    if (price) {
+      entry.pricing ??= {};
+      if (price.label === 'Input') entry.pricing.input = price.usdPerMillion;
+      else if (price.label === 'Cached input') entry.pricing.cachedInput = price.usdPerMillion;
+      else if (price.label === 'Output') entry.pricing.output = price.usdPerMillion;
+    }
+  }
+
+  if (!entry.modelUid) return null;
+  entry.label ||= entry.modelUid;
+  return entry;
+}
+
+async function fetchCatalog(
+  apiKey: string,
+  host: string,
+  signal: AbortSignal | undefined,
+  fetchFn: FetchFn,
+): Promise<ModelCatalog> {
+  const userJwt = await getCachedUserJwt(apiKey, host, fetchFn);
+  const resp = await fetchFn(`${host}/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs`, {
+    method: 'POST',
+    headers: UNARY_PROTO_HEADERS,
+    body: new Uint8Array(encodeMessage(1, buildMetadata({ apiKey, userJwt }))),
+    signal: timeoutSignal(CATALOG_FETCH_TIMEOUT_MS, signal),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`GetCascadeModelConfigs HTTP ${resp.status}: ${text.slice(0, 200)}`);
+  }
+
+  const byUid = new Map<string, ModelCatalogEntry>();
+  for (const f of iterFields(Buffer.from(await resp.arrayBuffer()))) {
+    const config = fieldBytes(f, 1);
+    const entry = config && parseClientModelConfig(config);
+    if (entry) byUid.set(entry.modelUid, entry);
+  }
+  return { byUid, fetchedAt: Date.now() };
+}
+
+const cache = new Map<string, ModelCatalog>();
+const inFlight = new Map<string, Promise<ModelCatalog>>();
+/** Bumped on clear so a fetch that started before the clear cannot repopulate the cache. */
+let cacheEpoch = 0;
+
+const isFresh = (catalog: ModelCatalog): boolean => Date.now() - catalog.fetchedAt < CATALOG_TTL_MS;
+
+/**
+ * The account's model catalog, from cache when fresh. Rejects when the fetch
+ * fails; concurrent callers share one in-flight fetch.
+ */
+export async function getCachedCatalog(
+  apiKey: string,
+  host?: string,
+  signal?: AbortSignal,
+  fetchFn: FetchFn = globalThis.fetch,
+): Promise<ModelCatalog> {
+  const baseUrl = normalizeHost(host);
+  const key = accountKey(apiKey, baseUrl);
+  const cached = cache.get(key);
+  if (cached && isFresh(cached)) return cached;
+
+  const existing = inFlight.get(key);
+  if (existing) return existing;
+
+  const epochAtStart = cacheEpoch;
+  const promise = fetchCatalog(apiKey, baseUrl, signal, fetchFn)
+    .then((catalog) => {
+      if (cacheEpoch === epochAtStart) cache.set(key, catalog);
+      return catalog;
+    })
+    .finally(() => {
+      if (inFlight.get(key) === promise) inFlight.delete(key);
+    });
+  inFlight.set(key, promise);
+  return promise;
+}
+
+/**
+ * The in-memory catalog, without waiting on the network. A missing or stale
+ * catalog triggers a background refresh; a stale one is still returned.
+ */
+export function getCatalogSnapshot(
+  apiKey: string,
+  host?: string,
+  fetchFn: FetchFn = globalThis.fetch,
+): ModelCatalog | null {
+  const baseUrl = normalizeHost(host);
+  const cached = cache.get(accountKey(apiKey, baseUrl)) ?? null;
+  if (!cached || !isFresh(cached)) {
+    getCachedCatalog(apiKey, baseUrl, undefined, fetchFn).catch(() => {});
+  }
+  return cached;
+}
+
+export function clearCachedCatalog(): void {
+  cache.clear();
+  inFlight.clear();
+  cacheEpoch++;
 }

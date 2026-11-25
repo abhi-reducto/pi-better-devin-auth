@@ -1,170 +1,166 @@
 /**
- * Pure mapping module that converts pi's conversation model
- * (`Message[]`, `Tool[]`, `systemPrompt`) into the `ChatHistoryItem[]` +
- * `ToolDef[]` shapes that the cloud-direct gRPC layer expects.
+ * Maps Pi's transcript (`Context`) to the cloud-direct chat shapes.
  *
- * No side effects, no I/O — trivially unit-testable.
+ * Two properties matter beyond a faithful translation:
+ *
+ *   - Prompt-cache stability. The leading system prompt stays the first
+ *     message, and later system messages (skill loads, tool-set changes) are
+ *     rendered in place as `<system-update>` user messages, so earlier turns
+ *     encode to identical bytes on every request.
+ *   - A well-formed tool exchange. Every assistant tool call is followed by a
+ *     result, which means synthesizing one for calls an interrupted turn left
+ *     unanswered, and tool call ids are normalized to a form every backend
+ *     behind Cognition accepts.
  */
-import type { Context, Message, Tool } from '@earendil-works/pi-ai';
-import type { ChatHistoryItem, ContentPart, ToolDef } from './cloud-direct/chat.js';
 
-/** Result of mapping a pi {@link Context} into cloud-direct shapes. */
+import {
+  getCurrentTools,
+  getInitialSystemMessage,
+  getSystemMessageText,
+  renderSystemMessageUpdate,
+  type AssistantMessage,
+  type Context,
+  type ImageContent,
+  type TextContent,
+} from '@earendil-works/pi-ai';
+import type { ChatHistoryItem, ContentPart, ToolCallRef, ToolDef } from './cloud-direct/index.js';
+
 export interface MappedChat {
-    messages: ChatHistoryItem[];
-    tools: ToolDef[];
+  messages: ChatHistoryItem[];
+  tools: ToolDef[];
 }
 
-/** pi content-part shapes we care about for mapping. */
-interface TextContent {
-    type: 'text';
-    text: string;
-}
-interface ImageContent {
-    type: 'image';
-    data: string;
-    mimeType: string;
-}
-interface ThinkingContent {
-    type: 'thinking';
-    thinking: string;
-}
-interface ToolCallContent {
-    type: 'toolCall';
-    id: string;
-    name: string;
-    arguments: Record<string, unknown>;
-}
+const INTERRUPTED_TOOL_RESULT = 'No result provided (tool execution interrupted).';
 
-/** Discriminated union of assistant content parts. */
-type AssistantContentPart = TextContent | ThinkingContent | ToolCallContent;
-
-/** User/toolResult content parts (no thinking, no toolCall). */
-type UserContentPart = TextContent | ImageContent;
+const systemUpdate = (text: string): ChatHistoryItem => ({
+  role: 'user',
+  content: `<system-update>\n${text}\n</system-update>`,
+});
 
 /**
- * Map pi user/toolResult content (string or array of text/image parts)
- * into the cloud-direct `ContentPart[]` form. String content is passed
- * through as-is (ChatHistoryItem.content accepts the string shorthand).
+ * Rewrites tool call ids that some backend would reject (OpenAI Responses
+ * ids are ~450 chars with `|`), mapping each distinct id to one stable
+ * replacement. Ids that are already safe pass through unchanged, which keeps
+ * the prompt cache intact.
  */
-function mapContent(
-    content: string | UserContentPart[],
-): string | ContentPart[] {
-    if (typeof content === 'string') return content;
-    const out: ContentPart[] = [];
-    for (const part of content) {
-        if (part.type === 'text') {
-            out.push({ type: 'text', text: part.text });
-        } else if (part.type === 'image') {
-            out.push({
-                type: 'image',
-                mimeType: part.mimeType,
-                base64Data: part.data,
-            });
-        }
-        // Unknown part types are skipped.
+class ToolCallIds {
+  readonly #replacements = new Map<string, string>();
+
+  normalize(id: string): string {
+    if (/^[a-zA-Z0-9_-]{1,64}$/.test(id)) return id;
+    let replacement = this.#replacements.get(id);
+    if (!replacement) {
+      const stem = id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'call';
+      replacement = `${stem}_${this.#replacements.size + 1}`;
+      this.#replacements.set(id, replacement);
     }
-    return out;
+    return replacement;
+  }
 }
 
-/**
- * Extract visible text from an assistant message's content array.
- * Joins all `TextContent` entries with `\n`. `ThinkingContent` and
- * `ToolCall` entries are skipped — thinking is internal to the model
- * and tool calls are surfaced separately via {@link extractToolCalls}.
- */
-function extractText(content: AssistantContentPart[]): string {
-    const texts: string[] = [];
-    for (const part of content) {
-        if (part.type === 'text') texts.push(part.text);
-    }
-    return texts.join('\n');
+function mapContent(content: string | (TextContent | ImageContent)[]): string | ContentPart[] {
+  if (typeof content === 'string') return content;
+  return content.map((part) =>
+    part.type === 'text'
+      ? { type: 'text', text: part.text }
+      : { type: 'image', mimeType: part.mimeType, base64Data: part.data },
+  );
 }
 
-/**
- * Extract tool calls from an assistant message's content array into the
- * cloud-direct `tool_calls` shape. `arguments` is serialized to a JSON
- * string (the cloud proto expects `arguments_json`). Returns `undefined`
- * when there are no tool calls so the `tool_calls` field stays absent on
- * the resulting {@link ChatHistoryItem}.
- */
-function extractToolCalls(
-    content: AssistantContentPart[],
-): Array<{ id: string; name: string; arguments: string }> | undefined {
-    const calls: Array<{ id: string; name: string; arguments: string }> = [];
-    for (const part of content) {
-        if (part.type === 'toolCall') {
-            calls.push({
-                id: part.id,
-                name: part.name,
-                arguments: JSON.stringify(part.arguments),
-            });
-        }
-    }
-    return calls.length > 0 ? calls : undefined;
+/** An interrupted turn can leave an assistant message with nothing in it; it carries no information. */
+function isEmptyFailure(msg: AssistantMessage): boolean {
+  return (msg.stopReason === 'aborted' || msg.stopReason === 'error') && msg.content.length === 0;
 }
 
-/**
- * Map a single pi {@link Message} into a cloud-direct {@link ChatHistoryItem}.
- *
- * - `UserMessage`        -> `{ role: 'user', content: mapContent(...) }`
- * - `AssistantMessage`   -> `{ role: 'assistant', content: extractText(...),
- *                              tool_calls: extractToolCalls(...) }`
- * - `ToolResultMessage`  -> `{ role: 'tool', content: mapContent(...),
- *                              tool_call_id: msg.toolCallId }`
- */
-function mapMessage(msg: Message): ChatHistoryItem {
-    if (msg.role === 'user') {
-        return {
-            role: 'user',
-            content: mapContent(msg.content as string | UserContentPart[]),
-        };
+/** Thinking blocks are dropped: Cognition's wire format has no way to replay them. */
+function mapAssistant(msg: AssistantMessage, ids: ToolCallIds): ChatHistoryItem {
+  const text: string[] = [];
+  const toolCalls: ToolCallRef[] = [];
+  for (const part of msg.content) {
+    if (part.type === 'text') text.push(part.text);
+    else if (part.type === 'toolCall') {
+      toolCalls.push({
+        id: ids.normalize(part.id),
+        name: part.name,
+        arguments: JSON.stringify(part.arguments ?? {}),
+      });
     }
-    if (msg.role === 'assistant') {
-        const parts = msg.content as AssistantContentPart[];
-        const toolCalls = extractToolCalls(parts);
-        const item: ChatHistoryItem = {
-            role: 'assistant',
-            content: extractText(parts),
-        };
-        if (toolCalls !== undefined) item.tool_calls = toolCalls;
-        return item;
-    }
-    // role === 'toolResult'
-    return {
-        role: 'tool',
-        content: mapContent(msg.content as UserContentPart[]),
-        tool_call_id: msg.toolCallId,
-    };
+  }
+  return {
+    role: 'assistant',
+    content: text.join('\n'),
+    ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+  };
 }
 
-/**
- * Convert a pi {@link Context} (systemPrompt + messages + tools) into the
- * `ChatHistoryItem[]` + `ToolDef[]` shapes consumed by the cloud-direct
- * gRPC chat layer.
- *
- * If `context.systemPrompt` is present it is prepended as a `system`
- * message; cloud-direct's `collapseSystemIntoUser` will inline it into
- * the next user turn downstream — we just pass it through here.
- */
 export function mapContextToChat(context: Context): MappedChat {
-    const messages: ChatHistoryItem[] = [];
+  const source = context.messages ?? [];
+  const messages: ChatHistoryItem[] = [];
+  const ids = new ToolCallIds();
 
-    if (context.systemPrompt) {
-        messages.push({ role: 'system', content: context.systemPrompt });
+  const leadingSystem = getInitialSystemMessage(source);
+  const hasSystemMessages = source.some((msg) => msg.role === 'system');
+  const systemPrompt = leadingSystem
+    ? getSystemMessageText(leadingSystem)
+    : hasSystemMessages
+      ? undefined
+      : context.systemPrompt;
+  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+
+  // The open tool exchange: calls the last assistant message made that have no
+  // result yet, and system updates that must wait until the exchange closes
+  // so they don't split a call from its result.
+  const unanswered = new Set<string>();
+  const heldUpdates: string[] = [];
+
+  const closeToolExchange = (): void => {
+    for (const id of unanswered) {
+      messages.push({ role: 'tool', tool_call_id: id, content: INTERRUPTED_TOOL_RESULT });
     }
+    unanswered.clear();
+    if (heldUpdates.length > 0) messages.push(systemUpdate(heldUpdates.join('\n\n')));
+    heldUpdates.length = 0;
+  };
 
-    for (const msg of context.messages) {
-        messages.push(mapMessage(msg));
+  for (const msg of source) {
+    switch (msg.role) {
+      case 'system': {
+        if (msg === leadingSystem) break;
+        const text = renderSystemMessageUpdate(msg);
+        if (!text) break;
+        if (unanswered.size > 0) heldUpdates.push(text);
+        else messages.push(systemUpdate(text));
+        break;
+      }
+      case 'toolResult': {
+        const id = ids.normalize(msg.toolCallId);
+        unanswered.delete(id);
+        messages.push({ role: 'tool', tool_call_id: id, content: mapContent(msg.content) });
+        break;
+      }
+      case 'user':
+        closeToolExchange();
+        messages.push({ role: 'user', content: mapContent(msg.content) });
+        break;
+      case 'assistant': {
+        closeToolExchange();
+        if (isEmptyFailure(msg)) break;
+        const mapped = mapAssistant(msg, ids);
+        messages.push(mapped);
+        for (const call of mapped.tool_calls ?? []) unanswered.add(call.id);
+        break;
+      }
     }
+  }
+  closeToolExchange();
 
-    const tools: ToolDef[] = (context.tools ?? []).map(
-        (tool: Tool): ToolDef => ({
-            name: tool.name,
-            description: tool.description,
-            // tool.parameters is a TSchema (JSON Schema object) — pass through.
-            parameters: tool.parameters as unknown,
-        }),
-    );
-
-    return { messages, tools };
+  const tools = hasSystemMessages ? getCurrentTools(source) : (context.tools ?? []);
+  return {
+    messages,
+    tools: tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    })),
+  };
 }

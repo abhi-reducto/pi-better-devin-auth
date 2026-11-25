@@ -1,141 +1,114 @@
 /**
- * pi extension entry point for the Devin (Cognition) provider.
- *
- * Registers the `devin` provider with pi's ExtensionAPI, wiring up:
- *  - OAuth login via Windsurf's browser sign-in flow (`loginDevin`)
- *  - A no-op token refresh (Windsurf api_keys are long-lived)
- *  - Live model catalog fetch from Cognition's GetCascadeModelConfigs
- *    after login, filtered to 11 wanted model families
- *  - `/devin-refresh` command to manually re-fetch the catalog
- *  - `/devin-status` command to check auth state
- *  - `session_start` auto-fetch when already logged in
- *  - Streaming chat completions through Devin Cloud (`streamDevin`)
- *
- * The provider uses `streamSimple` — no background proxy. All routing
- * and auth are handled internally via the OAuth-issued api_key.
+ * Pi extension entry point: registers the `devin` provider (Cognition /
+ * Windsurf) with browser sign-in, a live model catalog and native streaming,
+ * plus the `/devin-refresh` and `/devin-status` commands.
  */
 
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import type {
-    Api,
-    Model,
-    OAuthCredentials,
-    OAuthLoginCallbacks,
-} from '@earendil-works/pi-ai';
+import type { ExtensionAPI, ProviderModelConfig } from '@earendil-works/pi-coding-agent';
+import {
+  clearCachedCatalog,
+  clearCachedUserJwt,
+  decodeJwtPayload,
+  DEFAULT_HOST,
+  getCachedCatalog,
+  getCachedUserJwt,
+} from '../src/cloud-direct/index.js';
+import { buildLiveModels, FALLBACK_MODELS } from '../src/models.js';
+import { loginDevin, renewCredentials } from '../src/oauth/login.js';
 import { streamDevin } from '../src/stream.js';
-import { loginDevin } from '../src/oauth/login.js';
-import { buildLiveModels, FALLBACK_MODELS, DEFAULT_HOST } from '../src/models.js';
-import { getCachedCatalog, clearCachedCatalog } from '../src/cloud-direct/catalog.js';
-import { DEFAULT_REGION } from '../src/oauth/types.js';
 
 const PROVIDER_ID = 'devin';
-const PROVIDER_NAME = 'Devin (Cognition)';
-const OAUTH_NAME = 'Devin (Cognition / Windsurf)';
-const API_IDENTIFIER = 'devin-cloud';
-// pi requires baseUrl when models are defined, even with streamSimple.
-// streamSimple ignores this — it routes internally — but the field must be present.
-const PLACEHOLDER_BASE_URL = DEFAULT_HOST;
+const NOT_SIGNED_IN = 'Devin: not signed in. Run /login devin';
 
-let _pi: ExtensionAPI | null = null;
+const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-function registerDevinProvider(pi: ExtensionAPI, models: typeof FALLBACK_MODELS): void {
-    pi.registerProvider(PROVIDER_ID, {
-        name: PROVIDER_NAME,
-        api: API_IDENTIFIER,
-        baseUrl: PLACEHOLDER_BASE_URL,
-        models,
-        oauth: {
-            name: OAUTH_NAME,
-            async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-                const credentials = await loginDevin(callbacks, DEFAULT_REGION);
-                if (_pi) {
-                    try {
-                        clearCachedCatalog();
-                        const catalog = await getCachedCatalog(
-                            credentials.access,
-                            DEFAULT_HOST,
-                        );
-                        const liveModels = buildLiveModels(catalog);
-                        registerDevinProvider(_pi, liveModels);
-                    } catch {
-                        // keep static models if catalog fetch fails
-                    }
-                }
-                return credentials;
-            },
-            async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-                return credentials;
-            },
-            getApiKey(credentials: OAuthCredentials): string {
-                return credentials.access;
-            },
-            modifyModels(models: Model<Api>[]): Model<Api>[] {
-                return models;
-            },
-        },
-        streamSimple: streamDevin,
-    });
+function clearAccountCaches(): void {
+  clearCachedUserJwt();
+  clearCachedCatalog();
 }
 
-export default async function (pi: ExtensionAPI): Promise<void> {
-    _pi = pi;
-
-    registerDevinProvider(pi, FALLBACK_MODELS);
-
-    pi.on('session_start', async (_event, ctx) => {
-        try {
-            const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
-            if (apiKey && _pi) {
-                const catalog = await getCachedCatalog(apiKey, DEFAULT_HOST);
-                const liveModels = buildLiveModels(catalog);
-                registerDevinProvider(_pi, liveModels);
-            }
-        } catch {
-            // keep static models
-        }
-    });
-
-    pi.registerCommand('devin-refresh', {
-        description: 'Refresh Devin model catalog from Cognition',
-        handler: async (_args, ctx) => {
-            const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
-            if (!apiKey) {
-                ctx.ui.notify(
-                    'Devin: not signed in. Run /login devin',
-                    'warning',
-                );
-                return;
-            }
-            clearCachedCatalog();
-            try {
-                const catalog = await getCachedCatalog(apiKey, DEFAULT_HOST);
-                const liveModels = buildLiveModels(catalog);
-                registerDevinProvider(pi, liveModels);
-                ctx.ui.notify(
-                    `Devin: refreshed ${liveModels.length} models.`,
-                    'info',
-                );
-            } catch (e) {
-                ctx.ui.notify(
-                    `Devin: refresh error - ${e instanceof Error ? e.message : String(e)}`,
-                    'error',
-                );
-            }
+export default function (pi: ExtensionAPI): void {
+  /** Pi replaces a provider's model list by registering the provider again. */
+  const register = (models: ProviderModelConfig[]): void => {
+    pi.registerProvider(PROVIDER_ID, {
+      name: 'Devin (Cognition)',
+      api: 'devin-cloud',
+      baseUrl: DEFAULT_HOST,
+      models,
+      streamSimple: streamDevin,
+      async refreshModels(context) {
+        const cred = context.credential;
+        const apiKey = cred?.type === 'oauth' ? cred.access : cred?.key;
+        if (!apiKey || !context.allowNetwork) return FALLBACK_MODELS;
+        if (context.force) clearCachedCatalog();
+        const catalog = await getCachedCatalog(apiKey, context.baseUrl, context.signal).catch(() => null);
+        return catalog ? buildLiveModels(catalog) : FALLBACK_MODELS;
+      },
+      oauth: {
+        name: 'Devin (Cognition / Windsurf)',
+        isSubscription: true,
+        async login(callbacks) {
+          const credentials = await loginDevin(callbacks);
+          clearAccountCaches();
+          await loadLiveModels(credentials.access).catch(() => {});
+          return credentials;
         },
+        refreshToken: async (credentials) => renewCredentials(credentials),
+        getApiKey: (credentials) => credentials.access,
+      },
     });
+  };
 
-    pi.registerCommand('devin-status', {
-        description: 'Show Devin auth status',
-        handler: async (_args, ctx) => {
-            const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
-            ctx.ui.notify(
-                apiKey ? 'Devin: authenticated' : 'Devin: not signed in. Run /login devin',
-                apiKey ? 'info' : 'warning',
-            );
-        },
-    });
+  /** Fetch the account's catalog and register its models. Rejects if the fetch fails. */
+  const loadLiveModels = async (apiKey: string): Promise<number> => {
+    const models = buildLiveModels(await getCachedCatalog(apiKey));
+    register(models);
+    return models.length;
+  };
 
-    pi.on('session_shutdown', async () => {
-        _pi = null;
-    });
+  register(FALLBACK_MODELS);
+
+  // Warm the JWT and the catalog so the first chat turn pays for neither.
+  // Failures are fine: the fallback models stay and the turn mints its own JWT.
+  let lastApiKey: string | undefined;
+  pi.on('session_start', async (_event, ctx) => {
+    const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID).catch(() => undefined);
+    if (!apiKey) return;
+    if (lastApiKey && lastApiKey !== apiKey) clearAccountCaches();
+    lastApiKey = apiKey;
+    await Promise.allSettled([getCachedUserJwt(apiKey), loadLiveModels(apiKey)]);
+  });
+
+  pi.registerCommand('devin-refresh', {
+    description: 'Refresh Devin model catalog and JWT from Cognition',
+    handler: async (_args, ctx) => {
+      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+      if (!apiKey) return ctx.ui.notify(NOT_SIGNED_IN, 'warning');
+      clearAccountCaches();
+      try {
+        ctx.ui.notify(`Devin: refreshed ${await loadLiveModels(apiKey)} models.`, 'info');
+      } catch (e) {
+        ctx.ui.notify(`Devin: refresh failed - ${errorText(e)}`, 'error');
+      }
+    },
+  });
+
+  pi.registerCommand('devin-status', {
+    description: 'Show Devin auth status and account tier',
+    handler: async (_args, ctx) => {
+      const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+      if (!apiKey) return ctx.ui.notify(NOT_SIGNED_IN, 'warning');
+      try {
+        const claims = decodeJwtPayload(await getCachedUserJwt(apiKey)) ?? {};
+        const tier = typeof claims.teams_tier === 'string' ? claims.teams_tier : claims.pro ? 'pro' : 'free';
+        const ttl =
+          typeof claims.exp === 'number'
+            ? `${Math.max(0, Math.round((claims.exp * 1000 - Date.now()) / 60_000))}m`
+            : 'unknown';
+        ctx.ui.notify(`Devin: authenticated (tier=${tier}, jwt ttl=${ttl})`, 'info');
+      } catch (e) {
+        ctx.ui.notify(`Devin: signed in, but the JWT check failed - ${errorText(e)}`, 'warning');
+      }
+    },
+  });
 }

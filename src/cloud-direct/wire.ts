@@ -1,40 +1,41 @@
 /**
- * Manual protobuf + Connect-RPC streaming envelope helpers.
+ * Minimal, dependency-free protobuf + Connect-RPC streaming wire helpers.
  *
- * Connect-RPC streaming wire format (HTTPS POST body):
- *   ┌─────────────┬────────────────┬──────────────┐
- *   │ flags 1byte │ length 4B BE   │   payload    │
- *   └─────────────┴────────────────┴──────────────┘
- *   flags bit 0x01 = payload is gzip-compressed
- *   flags bit 0x02 = end-of-stream (trailer frame — JSON {error} or empty {})
- *
- * All `Get*` methods on `exa.api_server_pb.ApiServerService` that the
- * language_server calls upstream use this format, content-type
- * `application/connect+proto`, with `Connect-Protocol-Version: 1`.
- *
- * Kept tiny and dependency-free — same philosophy as src/plugin/protobuf.ts.
+ * Connect-RPC streaming frame layout:
+ *   [flags: 1B][length: 4B BE][payload: length B]
+ *     flags & 0x01 => payload is gzip-compressed
+ *     flags & 0x02 => end-of-stream trailer (JSON {} or {"error":{code,message}})
  */
 
-import * as zlib from 'zlib';
+import * as zlib from 'node:zlib';
+import { promisify } from 'node:util';
 
-// ----------------------------------------------------------------------------
-// Proto wire encode
-// ----------------------------------------------------------------------------
+const gzip = promisify(zlib.gzip);
+
+const WIRE_VARINT = 0;
+const WIRE_FIXED64 = 1;
+const WIRE_BYTES = 2;
+const WIRE_FIXED32 = 5;
+
+const FRAME_HEADER_BYTES = 5;
+const FLAG_COMPRESSED = 0x01;
+const FLAG_END_STREAM = 0x02;
+
+/** Upper bound for one inflated frame (decompression-bomb guard). */
+const MAX_GUNZIP_BYTES = 32 * 1024 * 1024;
+/** Upper bound for one frame on the wire; a larger length prefix means a corrupt stream. */
+const MAX_FRAME_BYTES = 64 * 1024 * 1024;
+/** Only gzip request payloads above 2 KiB; smaller bodies aren't worth the CPU. */
+const GZIP_THRESHOLD_BYTES = 2048;
+
+// ---------------------------------------------------------------------------
+// Protobuf encoding
+// ---------------------------------------------------------------------------
 
 export function encodeVarint(value: number | bigint): Buffer {
-  const v0 = BigInt(value);
-  // Reject negatives at the boundary. Proto3 spec encodes signed types as
-  // 10-byte sign-extended varints; we don't support that here and the
-  // current call sites never need it (tags, lengths, request ids — all
-  // strictly positive). The old loop body would have terminated with
-  // `Number(-1n)` = -1, producing a malformed single 0xFF byte that the
-  // server would misparse silently. Throw instead so future regressions
-  // surface immediately.
-  if (v0 < 0n) {
-    throw new RangeError(`encodeVarint: negative input not supported (got ${value})`);
-  }
+  let v = BigInt(value);
+  if (v < 0n) throw new RangeError(`encodeVarint: negative input not supported (got ${value})`);
   const bytes: number[] = [];
-  let v = v0;
   while (v > 127n) {
     bytes.push(Number(v & 0x7fn) | 0x80);
     v >>= 7n;
@@ -43,48 +44,49 @@ export function encodeVarint(value: number | bigint): Buffer {
   return Buffer.from(bytes);
 }
 
-export function encodeTag(fieldNum: number, wire: number): Buffer {
+function encodeTag(fieldNum: number, wire: number): Buffer {
   return encodeVarint((fieldNum << 3) | wire);
 }
 
-export function encodeString(fieldNum: number, s: string): Buffer {
-  const buf = Buffer.from(s, 'utf8');
-  return Buffer.concat([encodeTag(fieldNum, 2), encodeVarint(buf.length), buf]);
+/** Length-delimited field: a nested message or raw bytes. */
+export function encodeMessage(fieldNum: number, body: Buffer): Buffer {
+  return Buffer.concat([encodeTag(fieldNum, WIRE_BYTES), encodeVarint(body.length), body]);
 }
 
-export function encodeMessage(fieldNum: number, body: Buffer): Buffer {
-  return Buffer.concat([encodeTag(fieldNum, 2), encodeVarint(body.length), body]);
+export function encodeString(fieldNum: number, s: string): Buffer {
+  return encodeMessage(fieldNum, Buffer.from(s, 'utf8'));
 }
 
 export function encodeVarintField(fieldNum: number, v: number | bigint): Buffer {
-  return Buffer.concat([encodeTag(fieldNum, 0), encodeVarint(v)]);
+  return Buffer.concat([encodeTag(fieldNum, WIRE_VARINT), encodeVarint(v)]);
 }
 
-export function encodeFixed64Field(fieldNum: number, v: number): Buffer {
+export function encodeDoubleField(fieldNum: number, v: number): Buffer {
   const b = Buffer.alloc(8);
   b.writeDoubleLE(v, 0);
-  return Buffer.concat([encodeTag(fieldNum, 1), b]);
+  return Buffer.concat([encodeTag(fieldNum, WIRE_FIXED64), b]);
 }
 
+/** Body of a `google.protobuf.Timestamp` for the current time. */
 export function encodeTimestampBody(): Buffer {
   const now = Date.now();
-  const seconds = Math.floor(now / 1000);
   const nanos = (now % 1000) * 1_000_000;
   return Buffer.concat([
-    encodeVarintField(1, seconds),
+    encodeVarintField(1, Math.floor(now / 1000)),
     nanos > 0 ? encodeVarintField(2, nanos) : Buffer.alloc(0),
   ]);
 }
 
-// ----------------------------------------------------------------------------
-// Proto wire decode
-// ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Protobuf decoding
+// ---------------------------------------------------------------------------
 
 export function decodeVarint(buf: Buffer, offset: number): [bigint, number] {
   let res = 0n;
   let shift = 0n;
   let i = offset;
   while (i < buf.length) {
+    if (shift > 63n) throw new RangeError('varint overflow (>64 bits)');
     const b = buf[i++];
     res |= BigInt(b & 0x7f) << shift;
     if (!(b & 0x80)) return [res, i];
@@ -93,110 +95,158 @@ export function decodeVarint(buf: Buffer, offset: number): [bigint, number] {
   throw new Error('truncated varint');
 }
 
-export interface ProtoField {
-  num: number;
-  wire: number;
-  /** varint → bigint, fixed → 8/4 byte Buffer, length-delim → payload Buffer. */
-  value: bigint | Buffer;
-}
-
-export function* iterFields(buf: Buffer): Generator<ProtoField> {
-  let i = 0;
-  while (i < buf.length) {
-    const [tagBig, ai] = decodeVarint(buf, i);
-    i = ai;
-    const tag = Number(tagBig);
-    const num = tag >> 3;
-    const wire = tag & 0x7;
-    if (wire === 0) {
-      const [v, bi] = decodeVarint(buf, i);
-      i = bi;
-      yield { num, wire, value: v };
-    } else if (wire === 1) {
-      // Bounds-check: a truncated frame mustn't yield a short fixed64 slice
-      // that downstream readers treat as a full 8-byte value. Stop iterating
-      // cleanly instead.
-      if (i + 8 > buf.length) return;
-      yield { num, wire, value: buf.slice(i, i + 8) };
-      i += 8;
-    } else if (wire === 2) {
-      const [n, ci] = decodeVarint(buf, i);
-      i = ci;
-      const len = Number(n);
-      // Bounds-check: when the declared length runs past the buffer, the
-      // frame is corrupt or truncated. Returning short-buffered slices to
-      // downstream parsers used to misparse silently (M12).
-      if (len < 0 || i + len > buf.length) return;
-      yield { num, wire, value: buf.slice(i, i + len) };
-      i += len;
-    } else if (wire === 5) {
-      if (i + 4 > buf.length) return;
-      yield { num, wire, value: buf.slice(i, i + 4) };
-      i += 4;
-    } else if (wire === 3 || wire === 4) {
-      // Wire types 3 (start group) and 4 (end group) are deprecated in
-      // proto3 but show up in some Codeium server-generated messages. They
-      // carry no length info; the safe behavior is to stop iterating
-      // gracefully rather than tear down the whole frame parse.
-      return;
-    } else {
-      // Unknown wire type — bail rather than misalign.
-      return;
-    }
-  }
-}
-
-// ----------------------------------------------------------------------------
-// Connect-streaming envelope
-// ----------------------------------------------------------------------------
+export type ProtoField =
+  { num: number; wire: 0; value: bigint } | { num: number; wire: 1 | 2 | 5; value: Buffer };
 
 /**
- * Wrap `body` (a serialized proto message) in a Connect-streaming envelope.
- * If `compress` is true, gzip the payload and set the 0x01 flag.
+ * Walk the top-level fields of a message. Stops quietly at the first
+ * malformed or unknown-wire-type field, so a partially understood message
+ * still yields everything before the damage.
  */
-export function frameConnectStream(body: Buffer, compress = true): Buffer {
-  let payload = body;
-  let flags = 0;
-  if (compress) {
-    payload = zlib.gzipSync(body);
-    flags |= 0x01;
+export function* iterFields(buf: Buffer): Generator<ProtoField> {
+  let i = 0;
+  try {
+    while (i < buf.length) {
+      const [tagBig, afterTag] = decodeVarint(buf, i);
+      i = afterTag;
+      const tag = Number(tagBig);
+      const num = tag >>> 3;
+      const wire = tag & 0x07;
+      if (num <= 0) return;
+
+      if (wire === WIRE_VARINT) {
+        const [value, afterVal] = decodeVarint(buf, i);
+        i = afterVal;
+        yield { num, wire, value };
+        continue;
+      }
+
+      let len: number;
+      if (wire === WIRE_FIXED64) len = 8;
+      else if (wire === WIRE_FIXED32) len = 4;
+      else if (wire === WIRE_BYTES) {
+        const [lenBig, afterLen] = decodeVarint(buf, i);
+        i = afterLen;
+        len = Number(lenBig);
+      } else return; // deprecated group markers (3/4) or unknown wire type
+
+      if (!Number.isSafeInteger(len) || i + len > buf.length) return;
+      yield { num, wire, value: buf.subarray(i, i + len) };
+      i += len;
+    }
+  } catch {
+    // truncated / overflowing varint — treat like any other malformed tail
   }
-  const header = Buffer.alloc(5);
-  header[0] = flags;
+}
+
+/** UTF-8 value of a length-delimited field, or undefined for any other field. */
+export function fieldString(f: ProtoField, num: number): string | undefined {
+  return f.num === num && f.wire === WIRE_BYTES ? f.value.toString('utf8') : undefined;
+}
+
+/** Sub-message bytes of a length-delimited field, or undefined for any other field. */
+export function fieldBytes(f: ProtoField, num: number): Buffer | undefined {
+  return f.num === num && f.wire === WIRE_BYTES ? f.value : undefined;
+}
+
+/** Value of a varint field as a JS number, or undefined for any other field. */
+export function fieldVarint(f: ProtoField, num: number): number | undefined {
+  return f.num === num && f.wire === WIRE_VARINT ? Number(f.value) : undefined;
+}
+
+/** Value of a fixed32 field read as an IEEE-754 float, or undefined for any other field. */
+export function fieldFloat(f: ProtoField, num: number): number | undefined {
+  return f.num === num && f.wire === WIRE_FIXED32 ? f.value.readFloatLE(0) : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Connect streaming envelope
+// ---------------------------------------------------------------------------
+
+/** Wrap one message in a Connect streaming envelope, gzipping it when worthwhile. */
+export async function frameConnectMessage(body: Buffer): Promise<{ frame: Buffer; compressed: boolean }> {
+  const compressed = body.length >= GZIP_THRESHOLD_BYTES;
+  const payload = compressed ? await gzip(body) : body;
+  const header = Buffer.alloc(FRAME_HEADER_BYTES);
+  header[0] = compressed ? FLAG_COMPRESSED : 0;
   header.writeUInt32BE(payload.length, 1);
-  return Buffer.concat([header, payload]);
+  return { frame: Buffer.concat([header, payload]), compressed };
 }
 
 export interface ConnectFrame {
-  flags: number;
-  /** Decompressed payload (gzip handled here if flags & 0x01). */
   payload: Buffer;
-  /** Frame is the trailer (end-of-stream). */
-  eos: boolean;
+  /** True for the end-of-stream trailer frame. */
+  endStream: boolean;
 }
 
 /**
- * Parse all Connect-streaming frames out of a response body.
- *
- * Returns array of decoded frames. Each frame's payload is already gzip-decoded
- * if the compression flag was set.
+ * Incremental Connect frame decoder. Feed it network chunks as they arrive;
+ * it returns every frame completed so far and buffers the remainder. Chunks
+ * are queued, not concatenated, so long streams stay linear in total bytes.
  */
-export function parseConnectFrames(buf: Buffer): ConnectFrame[] {
-  const out: ConnectFrame[] = [];
-  let i = 0;
-  while (i + 5 <= buf.length) {
-    const flags = buf[i];
-    const len = buf.readUInt32BE(i + 1);
-    if (i + 5 + len > buf.length) break;
-    let payload = buf.slice(i + 5, i + 5 + len);
-    if (flags & 0x01) {
-      // Compressed frame. If gunzip fails the frame is genuinely corrupt
-      // — surfacing as a thrown error beats parsing raw gzip bytes as proto
-      // (which previously produced misleading "yielded bad wire type" downstream).
-      payload = zlib.gunzipSync(payload);
-    }
-    out.push({ flags, payload, eos: (flags & 0x02) !== 0 });
-    i += 5 + len;
+export class ConnectFrameDecoder {
+  #chunks: Buffer[] = [];
+  #buffered = 0;
+
+  /** Bytes received that do not yet form a complete frame. */
+  get pendingBytes(): number {
+    return this.#buffered;
   }
-  return out;
+
+  /** Throws on a corrupt stream: an oversized frame or a payload that fails to inflate. */
+  push(chunk: Uint8Array): ConnectFrame[] {
+    const frames: ConnectFrame[] = [];
+    if (chunk.length === 0) return frames;
+    this.#chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+    this.#buffered += chunk.length;
+
+    while (this.#buffered >= FRAME_HEADER_BYTES) {
+      const header = this.#peek(FRAME_HEADER_BYTES);
+      const flags = header[0];
+      const len = header.readUInt32BE(1);
+      if (len > MAX_FRAME_BYTES) {
+        throw new Error(`Connect frame of ${len} bytes exceeds the ${MAX_FRAME_BYTES}-byte limit`);
+      }
+      if (this.#buffered < FRAME_HEADER_BYTES + len) break; // frame still arriving
+
+      this.#drop(FRAME_HEADER_BYTES);
+      const raw = this.#peek(len);
+      this.#drop(len);
+      frames.push({
+        payload: flags & FLAG_COMPRESSED ? zlib.gunzipSync(raw, { maxOutputLength: MAX_GUNZIP_BYTES }) : raw,
+        endStream: (flags & FLAG_END_STREAM) !== 0,
+      });
+    }
+    return frames;
+  }
+
+  /** The first `n` buffered bytes, without consuming them. Requires `n <= pendingBytes`. */
+  #peek(n: number): Buffer {
+    if (n === 0) return Buffer.alloc(0);
+    const head = this.#chunks[0];
+    if (head.length >= n) return head.subarray(0, n);
+    const parts: Buffer[] = [];
+    let remaining = n;
+    for (const c of this.#chunks) {
+      if (remaining <= 0) break;
+      parts.push(c.length <= remaining ? c : c.subarray(0, remaining));
+      remaining -= c.length;
+    }
+    return Buffer.concat(parts, n);
+  }
+
+  #drop(n: number): void {
+    this.#buffered -= n;
+    let remaining = n;
+    while (remaining > 0) {
+      const head = this.#chunks[0];
+      if (head.length <= remaining) {
+        this.#chunks.shift();
+        remaining -= head.length;
+      } else {
+        this.#chunks[0] = head.subarray(remaining);
+        remaining = 0;
+      }
+    }
+  }
 }

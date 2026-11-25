@@ -1,58 +1,34 @@
 {
-  "name": "pi-devin-auth",
-  "version": "0.1.2",
-  "description": "Pi coding agent extension for Devin/Cognition (Windsurf) OAuth + streaming",
+  "name": "pi-better-devin-auth",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Pi coding agent extension: Devin (Cognition / Windsurf) provider with browser sign-in and native streaming",
   "type": "module",
-  "keywords": [
-    "pi-package",
-    "devin",
-    "cognition",
-    "windsurf",
-    "oauth",
-    "pi-extension",
-    "custom-provider"
-  ],
-  "author": "nmzpy",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/nmzpy/pi-devin-auth.git"
-  },
-  "homepage": "https://github.com/nmzpy/pi-devin-auth#readme",
-  "bugs": {
-    "url": "https://github.com/nmzpy/pi-devin-auth/issues"
-  },
   "pi": {
     "extensions": [
       "./extensions/index.ts"
     ]
   },
-  "files": [
-    "extensions/",
-    "src/",
-    "README.md",
-    "AGENTS.md",
-    "LICENSE"
-  ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "node --test --import tsx tests/stream.test.ts"
+    "typecheck": "tsc",
+    "test": "node --import tsx --test \"tests/*.test.ts\"",
+    "format": "prettier --write .",
+    "check": "prettier --check . && tsc && npm test"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-ai": ">=1.6.0",
+    "@earendil-works/pi-coding-agent": ">=1.6.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@types/node": "^25.0.0",
+    "@earendil-works/pi-ai": "^1.6.0",
+    "@earendil-works/pi-coding-agent": "^1.6.0",
+    "@types/node": "^22.19.0",
+    "prettier": "^3.6.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.9.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.19.0"
   }
 }

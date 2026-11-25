@@ -1,64 +1,60 @@
-# pi-devin-auth
+# pi-better-devin-auth
 
-A [pi](https://pi.dev) coding agent extension that adds the **Devin** (Cognition / Windsurf) provider with browser-based OAuth login and native streaming.
+A [pi](https://pi.dev) extension that adds a `devin` provider: Cognition / Windsurf models, used
+through your Windsurf subscription, with browser sign-in and native streaming.
+
+This is a rewrite of [`nmzpy/pi-devin-auth`](https://github.com/nmzpy/pi-devin-auth) 0.1.2, whose
+cloud client derives from [`opencode-windsurf-auth`](https://github.com/rsvedant/opencode-windsurf-auth).
 
 ## Install
 
-### Via pi (recommended)
-
 ```bash
-pi install npm:pi-devin-auth
+pi install git:github.com/zhuasy/pi-better-devin-auth
 ```
 
-Then enable the extension:
+Pi loads the TypeScript directly; there is no build step.
 
-```bash
-pi config
-```
+## Use
 
-### Manual / local dev
+| Command                        | What it does                                                          |
+| ------------------------------ | --------------------------------------------------------------------- |
+| `/login devin`                 | Opens Windsurf sign-in; paste the token the page shows back into Pi.  |
+| `/model devin/claude-opus-5-5` | Pick a model. The thinking level selects the Cognition effort.        |
+| `/devin-status`                | Account tier and remaining lifetime of the current session JWT.       |
+| `/devin-refresh`               | Re-fetch the account's model catalog (limits, pricing, availability). |
+| `/logout devin`                | Forget the stored API key.                                            |
 
-```bash
-pi -e ./extensions/index.ts
-```
-
-Or copy `extensions/index.ts` into `~/.pi/agent/extensions/` for auto-discovery.
-
-## Usage
-
-### Login
-
-```
-/login devin
-```
-
-This opens `https://windsurf.com/windsurf/signin` in your browser. After signing in, the page displays an auth token — paste it into the pi prompt. The extension exchanges it for a long-lived Devin API key via `register.windsurf.com`.
-
-### Select a model
-
-```
-/model devin/swe-1-6
-```
-
-### Logout
-
-```
-/logout devin
-```
+Models come in two forms. A base model such as `claude-opus-5-5` follows Pi's thinking level (`low` to
+`max`). A variant such as `claude-opus-5-5-high` is pinned to one effort.
 
 ## How it works
 
 ```
-pi  --login-->  windsurf.com (Auth0)  --token-->  register.windsurf.com (RegisterUser)  --api_key-->  ~/.pi/agent/auth.json
-pi  --chat-->   streamDevin()  -->  cloud-direct/streamChatEvents()  -->  server.codeium.com (GetChatMessage gRPC)  -->  pi events
+/login   windsurf.com sign-in ─ token ─▶ register.windsurf.com RegisterUser ─ api_key ─▶ ~/.pi/agent/auth.json
+chat     Pi ─▶ streamDevin ─▶ server.codeium.com GetChatMessage (Connect-RPC stream) ─▶ Pi stream events
 ```
 
-The extension reuses the battle-tested cloud-direct gRPC layer from [opencode-windsurf-auth](https://github.com/rsvedant/opencode-windsurf-auth) and wraps it in pi's native `streamSimple` + `oauth` extension API.
+Each chat request sends the API key plus a short-lived user JWT (minted by `GetUserJwt`, cached in
+memory, refreshed before it expires). Session and cascade ids are derived from Pi's session id, which is
+what lets Cognition's prompt cache hit across turns and restarts.
 
-## Models
+## Things to know
 
-Models are fetched dynamically from Cognition's `GetCascadeModelConfigs` RPC after login, so the list always reflects what your account tier can access. A static fallback set is included for offline use.
+- **Unofficial client.** The extension identifies itself to Cognition as the Windsurf IDE and speaks a
+  protocol reconstructed from its traffic. It can break whenever Cognition changes that protocol, and
+  using a subscription this way may be against Cognition's terms.
+- **The API key is long-lived** and stored by Pi in `~/.pi/agent/auth.json`. It is only ever sent to
+  the Cognition API server and never appears in logs or in the payload passed to `onPayload` hooks.
+- **Personal accounts only.** Sign-in always uses the default region and API server; enterprise, EU
+  and FedStart tenants are not supported.
+- **Thinking is not replayed.** Cognition's wire format has no field for prior reasoning, so thinking
+  blocks from earlier turns are dropped from the history.
 
-## License
+## Develop
 
-MIT
+```bash
+npm install
+npm run check     # prettier + tsc + tests
+```
+
+Tests run offline against a fake cloud (`tests/helpers.ts`). See `AGENTS.md` for the layout.

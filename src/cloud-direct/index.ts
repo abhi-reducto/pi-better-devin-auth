@@ -1,41 +1,28 @@
 /**
- * Public surface of the cloud-direct module.
- *
- * Usage:
- *   import { streamChat } from './cloud-direct/index.js';
- *
- *   for await (const delta of streamChat({
- *     apiKey: creds.apiKey,
- *     apiServerUrl: creds.apiServerUrl,
- *     modelUid: 'swe-1-6',
- *     messages: [{ role: 'user', content: 'hi' }],
- *   })) {
- *     process.stdout.write(delta);
- *   }
+ * Public surface of the cloud-direct client: the three Cognition RPCs the
+ * provider needs (`GetUserJwt`, `GetCascadeModelConfigs`, `GetChatMessage`).
  */
 
-export {
-  streamChat,
-  streamChatEvents,
-  allocateCascadeId,
-  CloudChatError,
-  type CloudChatRequest,
-  type ChatHistoryItem,
-  type CloudChatEvent,
-  type ToolDef,
-} from './chat.js';
+export { streamChatEvents } from './chat.js';
+export { CloudChatError } from './types.js';
+export type {
+  ChatHistoryItem,
+  CloudChatEvent,
+  CloudChatRequest,
+  CompletionOptions,
+  ContentPart,
+  ToolCallRef,
+  ToolDef,
+} from './types.js';
 
-export {
-  mintUserJwt,
-  getCachedUserJwt,
-  clearCachedUserJwt,
-  CloudAuthError,
-} from './auth.js';
+export { getCachedUserJwt, clearCachedUserJwt, CloudAuthError } from './auth.js';
 
 export {
   getCachedCatalog,
   clearCachedCatalog,
   ModelNotAvailableError,
+  type ModelCatalog,
   type ModelCatalogEntry,
-  type CacheEntry,
 } from './catalog.js';
+
+export { DEFAULT_HOST, decodeJwtPayload } from './utils.js';
