@@ -25,4 +25,11 @@ export {
   type ModelCatalogEntry,
 } from './catalog.js';
 
+export {
+  getCachedQuota,
+  clearCachedQuota,
+  parseUserStatusResponse,
+  type DevinQuota,
+} from './quota.js';
+
 export { DEFAULT_HOST, decodeJwtPayload } from './utils.js';
