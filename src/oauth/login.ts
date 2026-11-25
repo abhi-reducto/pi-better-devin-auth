@@ -1,15 +1,27 @@
 /**
  * Browser sign-in to Windsurf through Pi's `OAuthLoginCallbacks`.
  *
- *   1. Open Windsurf's sign-in page with `redirect_uri=show-auth-token`,
- *      which makes the page display the resulting token instead of
- *      redirecting. (Pi's login callbacks cannot receive a redirect, so the
- *      user copies the token by hand.)
- *   2. The user pastes that token: a short-lived Firebase ID token.
- *   3. `registerUser` exchanges it for the long-lived API key Pi stores.
+ * Since Cognition rebranded Windsurf, the old OAuth redirect flow is no
+ * longer reliable from a browser: Devin rejects the old `redirect_uri`,
+ * `/show-auth-token` tries to launch Devin Desktop, and the manual
+ * Vim/Neovim page now redirects to the Devin download page.
+ *
+ * The most reliable path is to reuse an already-authenticated Devin CLI.
+ * If the Devin CLI has run `devin auth login`, its credentials file
+ * contains the long-lived `devin-session-token` API key that Pi needs.
+ * We extract it directly and skip the browser flow entirely.
+ *
+ *   1. Read ~/.local/share/devin/credentials.toml (Devin CLI default).
+ *   2. Use the `windsurf_api_key` field as the long-lived API key.
+ *   3. If no CLI credentials exist, fall back to the manual browser page
+ *      and paste the token.
+ *   4. `registerUser` exchanges the pasted Firebase ID token for the
+ *      API key only in the fallback path.
  */
 
-import * as crypto from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { OAuthCredentials, OAuthLoginCallbacks } from '@earendil-works/pi-ai';
 import { registerUser } from './register-user.js';
 import { DEFAULT_REGION, type WindsurfRegion } from './types.js';
@@ -29,21 +41,66 @@ export function renewCredentials(credentials: OAuthCredentials): OAuthCredential
   return credentialsFor(credentials.access);
 }
 
+/**
+ * Locate the Devin CLI credentials file. The CLI currently stores it at
+ * `~/.local/share/devin/credentials.toml` on Linux and similarly on
+ * macOS/Windows.
+ */
+function devinCliCredentialsPath(): string | undefined {
+  const platform = process.platform;
+  if (platform === 'win32') {
+    const appData = process.env.APPDATA;
+    if (!appData) return undefined;
+    return join(appData, 'devin', 'credentials.toml');
+  }
+  if (platform === 'darwin') {
+    return join(homedir(), 'Library', 'Application Support', 'devin', 'credentials.toml');
+  }
+  // Linux and other Unix-like systems
+  return join(homedir(), '.local', 'share', 'devin', 'credentials.toml');
+}
+
+/**
+ * Parse the simple TOML credentials file the Devin CLI writes.
+ * It only contains a few string keys, so a small regex is enough.
+ */
+function parseDevinCliCredentials(): { apiKey: string; apiServerUrl?: string } | undefined {
+  const path = devinCliCredentialsPath();
+  if (!path) return undefined;
+
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return undefined;
+  }
+
+  const apiKeyMatch = text.match(/^windsurf_api_key\s*=\s*"([^"]+)"/m);
+  if (!apiKeyMatch) return undefined;
+
+  const apiServerUrlMatch = text.match(/^api_server_url\s*=\s*"([^"]+)"/m);
+  return {
+    apiKey: apiKeyMatch[1]!,
+    apiServerUrl: apiServerUrlMatch ? apiServerUrlMatch[1] : undefined,
+  };
+}
+
 function signInUrl(region: WindsurfRegion): string {
-  const params = new URLSearchParams({
-    response_type: 'token', // implicit grant: no client secret
-    client_id: region.oauthClientId,
-    redirect_uri: 'show-auth-token',
-    state: crypto.randomUUID(), // required by Auth0; never returned to us
-    prompt: 'login', // always show the login screen, so the account can be chosen
-  });
-  return `${region.website}/windsurf/signin?${params}`;
+  // Last known manual-token page. Cognition keeps redirecting this, so the
+  // primary path is to reuse the Devin CLI credentials above.
+  return `${region.website}/enterprise/account/login?redirect_uri=vim-show-auth-token`;
 }
 
 export async function loginDevin(
   callbacks: OAuthLoginCallbacks,
   region: WindsurfRegion = DEFAULT_REGION,
 ): Promise<OAuthCredentials> {
+  const cliCredentials = parseDevinCliCredentials();
+  if (cliCredentials) {
+    callbacks.onProgress?.('Reusing existing Devin CLI credentials.');
+    return credentialsFor(cliCredentials.apiKey);
+  }
+
   callbacks.onAuth({ url: signInUrl(region) });
   const pasted = await callbacks.onPrompt({ message: 'Paste the token from the sign-in page:' });
   const firebaseIdToken = pasted?.trim();
